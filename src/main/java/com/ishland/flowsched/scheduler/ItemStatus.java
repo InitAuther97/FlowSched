@@ -13,11 +13,18 @@ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 public interface ItemStatus<K, V, Ctx> {
 
     @SuppressWarnings("rawtypes")
-    static KeyStatusPair[] EMPTY_DEPENDENCIES = new KeyStatusPair[0];
+    KeyStatusPair[] EMPTY_DEPENDENCIES = new KeyStatusPair[0];
+
+    byte STATUS_SIZE = 8, STATUS_MASK = Byte.MAX_VALUE;
+
+    @SuppressWarnings("unchecked")
+    static <K, V, Ctx> KeyStatusPair<K, V, Ctx>[] emptyDependencies() {
+        return EMPTY_DEPENDENCIES;
+    }
 
     default ItemStatus<K, V, Ctx> getPrev() {
-        if (this.ordinal() > 0) {
-            return getAllStatuses()[this.ordinal() - 1];
+        if (this.getOrdinal() > 0) {
+            return getAllStatuses()[this.getOrdinal() - 1];
         } else {
             return null;
         }
@@ -25,8 +32,17 @@ public interface ItemStatus<K, V, Ctx> {
 
     default ItemStatus<K, V, Ctx> getNext() {
         final ItemStatus<K, V, Ctx>[] allStatuses = getAllStatuses();
-        if (this.ordinal() < allStatuses.length - 1) {
-            return allStatuses[this.ordinal() + 1];
+        if (this.getOrdinal() < allStatuses.length - 1) {
+            return allStatuses[this.getOrdinal() + 1];
+        } else {
+            return null;
+        }
+    }
+    
+    default ItemStatus<K, V, Ctx> getAt(byte ordinal) {
+        final ItemStatus<K, V, Ctx>[] allStatuses = getAllStatuses();
+        if (ordinal < allStatuses.length) {
+            return allStatuses[ordinal];
         } else {
             return null;
         }
@@ -34,7 +50,7 @@ public interface ItemStatus<K, V, Ctx> {
 
     ItemStatus<K, V, Ctx>[] getAllStatuses();
 
-    int ordinal();
+    byte getOrdinal();
 
     Completable upgradeToThis(Ctx context, Cancellable cancellable);
 

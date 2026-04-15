@@ -28,14 +28,14 @@ public class SchedulerTest {
 
         final long key = 1024L;
         AtomicBoolean spamLoaderRunning = new AtomicBoolean(true);
-        ArrayList<CompletableFuture<Void>> spammedFutures = new ArrayList<>();
+        ArrayList<CompletableFuture<?>> spammedFutures = new ArrayList<>();
 
         Thread spamLoader = new Thread(() -> {
             Random random = new Random();
             while (spamLoaderRunning.get()) {
                 long victim = random.nextLong(key - 1);
                 ItemHolder<Long, TestItem, TestContext, Void> holder = scheduler.addTicket(victim, TestStatus.STATE_8, (Runnable) null);
-                CompletableFuture<Void> future = holder.getFutureForStatus0(TestStatus.STATE_8);
+                CompletableFuture<?> future = holder.getFutureForStatus0(TestStatus.STATE_8);
                 if (future.isCompletedExceptionally()) {
                     Assertions.fail();
                 }
@@ -87,7 +87,7 @@ public class SchedulerTest {
 
         System.out.println("All unloaded after " + (System.nanoTime() - startTime) + "ns");
 
-        for (CompletableFuture<Void> spammedFuture : spammedFutures) {
+        for (CompletableFuture<?> spammedFuture : spammedFutures) {
             if (!spammedFuture.isDone()) {
                 Assertions.fail();
             }

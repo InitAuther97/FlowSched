@@ -7,21 +7,20 @@ import java.lang.invoke.VarHandle;
 
 public class Cancellable {
 
-    @SuppressWarnings("unused")
-    private Runnable onCancel;
+    protected Runnable onCancel;
 
     public void setup(Runnable onCancel) {
         final var result = VH_CANCEL.getAndSet(this, onCancel);
-        Assertions.assertTrue(result != COMPLETED, "Cancellation is already completed when setup");
+        Assertions.assertTrue(result != C_COMPLETED, "Cancellation is already completed when setup");
     }
 
     public boolean complete() {
         while (true) {
             final var witness = (Runnable) VH_CANCEL.getAcquire(this);
-            if (witness == CANCELLED || witness == COMPLETED) {
+            if (witness == C_CANCELLED || witness == C_COMPLETED) {
                 return false;
             }
-            if (VH_CANCEL.weakCompareAndSetRelease(this, witness, COMPLETED)) {
+            if (VH_CANCEL.weakCompareAndSetRelease(this, witness, C_COMPLETED)) {
                 return true;
             }
         }
@@ -30,10 +29,10 @@ public class Cancellable {
     public boolean cancel() {
         while (true) {
             final Runnable witness = (Runnable) VH_CANCEL.get(this);
-            if (witness == CANCELLED || witness == COMPLETED) {
+            if (witness == C_CANCELLED || witness == C_COMPLETED) {
                 return false;
             }
-            if (VH_CANCEL.weakCompareAndSetRelease(this, witness, CANCELLED)) {
+            if (VH_CANCEL.weakCompareAndSetRelease(this, witness, C_CANCELLED)) {
                 if (witness != null) {
                     VarHandle.acquireFence();
                     witness.run();
@@ -44,16 +43,19 @@ public class Cancellable {
     }
 
     public boolean isCancelled() {
-        return VH_CANCEL.getAcquire(this) == CANCELLED;
+        return VH_CANCEL.getAcquire(this) == C_CANCELLED;
     }
 
     public boolean isCompleted() {
-        return VH_CANCEL.getAcquire(this) == COMPLETED;
+        return VH_CANCEL.getAcquire(this) == C_COMPLETED;
     }
 
     private static final VarHandle VH_CANCEL;
-    private static final Runnable CANCELLED = () -> {};
-    private static final Runnable COMPLETED = () -> {};
+    private static final Runnable C_CANCELLED = () -> {};
+    private static final Runnable C_COMPLETED = () -> {};
+
+    public static final Cancellable COMPLETED = new Cancellable();
+    public static final Cancellable CANCELLED = new Cancellable();
 
     static {
         try {
@@ -61,5 +63,8 @@ public class Cancellable {
         } catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
+        COMPLETED.setup(C_COMPLETED);
+        CANCELLED.setup(C_CANCELLED);
     }
+
 }

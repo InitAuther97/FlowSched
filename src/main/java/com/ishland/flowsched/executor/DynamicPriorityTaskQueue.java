@@ -25,7 +25,6 @@ public class DynamicPriorityTaskQueue<E extends Task> {
         for (int i = 0; i < priorityCount; i++) {
             this.priorities[i] = new ConcurrentLinkedQueue<>();
         }
-        VarHandle.fullFence();
     }
 
     public void enqueue(E element, int priority) {

@@ -31,6 +31,11 @@ public enum TestStatus implements ItemStatus<Long, TestItem, TestContext>, Compa
     }
 
     @Override
+    public byte getOrdinal() {
+        return (byte) ordinal();
+    }
+
+    @Override
     public Completable upgradeToThis(TestContext context, Cancellable cancellable) {
 //        System.out.println(String.format("Upgrading %d to %s", context.key(), this));
         if (TestSchedulerImpl.GLOBAL_RNG.nextBoolean()) {

@@ -3,6 +3,7 @@ package com.ishland.flowsched.executor;
 import com.ishland.flowsched.util.Assertions;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
@@ -45,11 +46,13 @@ public class ExecutorManager {
     public ExecutorManager(int workerThreadCount, Consumer<Thread> threadInitializer, int priorityCount) {
         globalWorkQueue = new DynamicPriorityTaskQueue<>(priorityCount);
         workerThreads = new WorkerThread[workerThreadCount];
+        // InitAuther97: make sure work queue is fully initialized before workers are started
+        VarHandle.storeStoreFence();
         for (int i = 0; i < workerThreadCount; i++) {
             final WorkerThread thread = new WorkerThread(this);
             threadInitializer.accept(thread);
-            thread.start();
             workerThreads[i] = thread;
+            thread.start();
         }
     }
 

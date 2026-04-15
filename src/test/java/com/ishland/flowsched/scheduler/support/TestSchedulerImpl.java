@@ -34,11 +34,6 @@ public class TestSchedulerImpl extends StatusAdvancingScheduler<Long, TestItem, 
     }
 
     @Override
-    protected Scheduler getSchedulerBackedByBackgroundExecutor() {
-        return backgroundScheduler;
-    }
-
-    @Override
     protected ItemStatus<Long, TestItem, TestContext> getUnloadedStatus() {
         return TestStatus.STATE_0;
     }
