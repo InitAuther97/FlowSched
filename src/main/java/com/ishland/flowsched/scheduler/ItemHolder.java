@@ -99,7 +99,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             Arrays.fill(refCnt, -1);
             return refCnt;
         };
-        VH_STATE.set(this, 1 | FLAG_FREE);
+        VH_STATE.setVolatile(this, 1 | FLAG_FREE);
         // InitAuther97: no fullFence slop
         // VarHandle.fullFence();
     }
@@ -136,7 +136,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     boolean casStatePlain(long expected, long next) {
-        return VH_STATE.weakCompareAndSetPlain(this, expected, next);
+        return expected == (long) VH_STATE.compareAndExchangeAcquire(this, expected, next);
     }
 
     long andStatePlain(long and) {

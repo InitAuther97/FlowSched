@@ -469,7 +469,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             AtomicInteger finished = new AtomicInteger(0);
             holder.setDependencies(nextStatus, dependencies);
             cancellable.setup(() -> {
-                if (!finished.compareAndSet(0, -1)) {
+                if (finished.compareAndSet(0, -1)) {
                     releaseDependencies(holder, nextStatus);
                     holder.scheduleFlushDependencyCache(this); // avoid dep cache poison due to partial upgrades when cancelled
                     emitter.onError(Constant.CANCELLED);
