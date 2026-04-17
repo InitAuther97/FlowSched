@@ -4,55 +4,52 @@ import com.ishland.flowsched.structs.OneTaskAtATimeExecutor;
 import com.ishland.flowsched.util.Assertions;
 import io.reactivex.rxjava3.core.Completable;
 import it.unimi.dsi.fastutil.Pair;
-import it.unimi.dsi.fastutil.objects.Object2ReferenceFunction;
-import it.unimi.dsi.fastutil.objects.Object2ReferenceLinkedOpenHashMap;
-import it.unimi.dsi.fastutil.objects.Object2ReferenceMap;
-import it.unimi.dsi.fastutil.objects.ObjectBidirectionalIterator;
+import it.unimi.dsi.fastutil.objects.*;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 
+import static com.ishland.flowsched.util.Constant.*;
+
 @SuppressWarnings("unused")
 class ItemHolderHotField {
-    /// empty | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | target status (8bit) | changing status (8bit) | status (8bit)
-    protected volatile int state;
-
-    protected volatile int scheduledDirty = 0; // Used by external threads
+    private long l0, l1, l2, l3, l4, l5, l6, l7;
+    /// flag_scheduler (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
+    protected volatile long state = 1; // Core synchronization point, responsible for upgrade/downgrade/future
+    private long l11, l12, l13, l14, l15, l16, l17; // padding
 }
 
 public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     // private static final VarHandle VH_SCHEDULED_DIRTY;
     static final VarHandle VH_STATE;
-    private static final VarHandle VH_FUTURES = MethodHandles.arrayElementVarHandle(CompletableFuture[].class);
 
-    public static final IllegalStateException UNLOADED_EXCEPTION = new IllegalStateException("Not loaded");
-    private static final CompletableFuture<?> UNLOADED_FUTURE = CompletableFuture.failedFuture(UNLOADED_EXCEPTION);
-    private static final CompletableFuture<?> COMPLETED_VOID_FUTURE = CompletableFuture.completedFuture(null);
-
-    public static final int FLAG_REMOVED = 1 << 24;
+    public static final long FLAG_REMOVED = 1L << 42;
     /**
      * Indicates the holder have been marked broken
      * If set, the holder:
      * - will not be allowed to be upgraded any further
      * - will still be allowed to be downgraded, but operations to it should be careful
      */
-    public static final int FLAG_BROKEN = 1 << 25;
+    public static final long FLAG_BROKEN = 1L << 43;
 
-    public static final int FLAG_DIRTY = 1 << 26;
+    public static final long FLAG_DIRTY = 1L << 44;
+
+    public static final long FLAG_BUSY = 1L << 45;
 
     static {
         try {
             final var lookup = MethodHandles.lookup();
             // VH_SCHEDULED_DIRTY = lookup.findVarHandle(ItemHolder.class, "scheduledDirty", int.class);
-            VH_STATE = lookup.findVarHandle(ItemHolder.class, "state", int.class);
+            VH_STATE = lookup.findVarHandle(ItemHolder.class, "state", long.class);
         } catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
@@ -62,7 +59,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     private final ItemStatus<K, V, Ctx> unloadedStatus;
     private final byte unloadedOrdinal;
     private final BusyRefCounter busyRefCounter = new BusyRefCounter();
-    private final TicketSet<K, V, Ctx> tickets;
+    private final Set<ItemTicket>[] tickets;
 //  private final List<Pair<ItemStatus<K, V, Ctx>, Long>> statusHistory = ReferenceLists.synchronize(new ReferenceArrayList<>());
     private final KeyStatusPair<K, V, Ctx>[][] requestedDependencies;
     private final Object2ReferenceLinkedOpenHashMap<K, int[]> dependencyRefCnts = new Object2ReferenceLinkedOpenHashMap<>() {
@@ -76,7 +73,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     private final Object2ReferenceFunction<K, int[]> depRefCntCreate;
     private final OneTaskAtATimeExecutor criticalSectionExecutor;
 
-    private volatile int state; // Core synchronization point, responsible for upgrade/downgrade/future
     private final CompletableFuture<?>[] futures; // Futures to fire by setStatus, only written by ticket ops threads
     private V item; // Piggyback on state read when read off scheduler threads
     private UserData userData; // Stable value
@@ -87,9 +83,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         this.unloadedStatus = Objects.requireNonNull(initialStatus);
         this.unloadedOrdinal = initialStatus.getOrdinal();
         this.key = Objects.requireNonNull(key);
-        this.tickets = new TicketSet<>(this.unloadedStatus, objectFactory);
-
         ItemStatus<K, V, Ctx>[] allStatuses = initialStatus.getAllStatuses();
+        this.tickets = new Set[allStatuses.length];
+        for (int i = 0; i < allStatuses.length; i++) {
+            this.tickets[i] = new ObjectOpenHashSet<>(ObjectOpenHashSet.DEFAULT_INITIAL_SIZE, ObjectOpenHashSet.FAST_LOAD_FACTOR);
+        }
         this.futures = new CompletableFuture[allStatuses.length];
         this.requestedDependencies = new KeyStatusPair[allStatuses.length][];
         for (int i = 0, allStatusesLength = allStatuses.length; i < allStatusesLength; i++) {
@@ -107,44 +105,59 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         // VarHandle.fullFence();
     }
 
-    static byte getTargetStatus(int state) {
-        return (byte) (state >>> (ItemStatus.STATUS_SIZE << 1) & ItemStatus.STATUS_MASK);
+    static byte getTargetStatus(long state) {
+        Assertions.assertTrue((state & 1) != 0);
+        return (byte) (31 - Integer.numberOfLeadingZeros((int) state));
     }
 
-    static int withTargetStatus(int state, byte targetStatus) {
-        return state & ~(ItemStatus.STATUS_MASK << (ItemStatus.STATUS_SIZE << 1)) | targetStatus << (ItemStatus.STATUS_SIZE << 1);
+    static byte getStatus(long state) {
+        return (byte) ((state >>> ItemStatus.STATUS_LENGTH) & ItemStatus.STATUS_MASK);
     }
 
-    static byte getStatus(int state) {
-        return (byte) (state & ItemStatus.STATUS_MASK);
+    static long withStatus(long state, byte status) {
+        return state & ~((long) ItemStatus.STATUS_MASK << ItemStatus.STATUS_LENGTH)
+                | (long) status << ItemStatus.STATUS_LENGTH;
     }
 
-    static int withStatus(int state, byte status) {
-        return state & ~ItemStatus.STATUS_MASK | status;
+    static byte getNextStatus(long state) {
+        return (byte) ((state >>> (ItemStatus.STATUS_SIZE + ItemStatus.STATUS_LENGTH)) & ItemStatus.STATUS_MASK);
     }
 
-    static byte getNextStatus(int state) {
-        return (byte) (state >>> ItemStatus.STATUS_SIZE & ItemStatus.STATUS_MASK);
+    static long withNextStatus(long state, byte nextStatus) {
+        return (state & ~((long) ItemStatus.STATUS_MASK << (ItemStatus.STATUS_SIZE + ItemStatus.STATUS_LENGTH)))
+                | ((long) nextStatus << (ItemStatus.STATUS_SIZE + ItemStatus.STATUS_LENGTH));
     }
 
-    static int withNextStatus(int state, byte nextStatus) {
-        return state & ~(ItemStatus.STATUS_MASK << ItemStatus.STATUS_SIZE) | nextStatus << (ItemStatus.STATUS_SIZE << 1);
+    static long undirty(long state) {
+        return state & ~FLAG_DIRTY;
     }
 
-    boolean casRelTarget(int expected, byte targetStatus) {
-        return VH_STATE.weakCompareAndSetRelease(this, expected, withTargetStatus(expected, targetStatus));
-    }
-
-    boolean casRelStatus(int expected, byte status) {
+    boolean casRelStatus(long expected, byte status) {
         return VH_STATE.weakCompareAndSetRelease(this, expected, withStatus(expected, status));
     }
 
-    int loState() {
-        return (int) VH_STATE.getAcquire(this);
+    boolean casStatePlain(long expected, long next) {
+        return VH_STATE.weakCompareAndSetPlain(this, expected, next);
     }
 
-    int lpState() {
-        return (int) VH_STATE.get(this);
+    long andStatePlain(long and) {
+        return (long) VH_STATE.getAndBitwiseAndAcquire(this, and);
+    }
+
+    long setTargetRelease(byte ordinal) {
+        return (long) VH_STATE.getAndBitwiseOrRelease(this, 1L << ordinal);
+    }
+
+    long unsetTargetRelease(byte ordinal) {
+        return (long) VH_STATE.getAndBitwiseAndRelease(this, ~(1L << ordinal));
+    }
+
+    long loState() {
+        return (long) VH_STATE.getAcquire(this);
+    }
+
+    long lpState() {
+        return (long) VH_STATE.get(this);
     }
 
     /**
@@ -155,7 +168,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             if (this.futures[i] != UNLOADED_FUTURE) {
                 failCreateFutures(this.futures[i]);
             }
-            this.futures[i] = null;
+            final var future = new CompletableFuture<>();
+            // InitAuther97: CompletableFuture does nothing in its constructor,
+            // therefore it is guaranteed by JVM to be well initialized when shared
+            // VarHandle.storeStoreFence(); // ensure visibility
+            this.futures[i] = future;
         }
     }
 
@@ -175,9 +192,14 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return this.unloadedStatus.getAt(getTargetStatus(loState()));
     }
 
-    public synchronized boolean isBusy() {
-        assertOpen();
-        return busyRefCounter.isBusy();
+    boolean tryLockSchedulerRelaxed() {
+        long state = (long) VH_STATE.get(this);
+        if ((state & FLAG_BUSY) != 0) return false;
+        return casStatePlain(state, state | FLAG_BUSY);
+    }
+
+    void unlockScheduler() {
+        andStatePlain(~FLAG_BUSY);
     }
 
     public ItemStatus<K, V, Ctx> changingStatusTo() {
@@ -186,113 +208,104 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return pair != null ? pair.right() : null;
     }
 
-    private boolean updateTargetStatus(int state, byte target) {
-        byte initial = target;
-        // Spin update target status
-        // Key information is current >= target (for early cancellation), thus need release for target update
-        while (!casRelTarget(state, target)) {
-            Thread.onSpinWait();
-            state = lpState();
-            // check for removed flag to break away
-            // may happen if lose race to scheduling
-            if ((state & FLAG_REMOVED) != 0) {
-                return false;
-            }
-            // get latest target status and retry
-            // load ordered is used to propagate hb relationship
-            target = this.tickets.loTargetStatus();
-            // someone has done it, exit
-            if (getTargetStatus(state) == target) break;
-            if (target < initial)
-                System.err.println("Got smaller target status than initial");
-        }
-        return true;
-    }
-
-    private boolean rescueHolder(ItemStatus<K, V, Ctx> targetStatus, int state) {
+    /*
+    private boolean rescueHolder(ItemStatus<K, V, Ctx> targetStatus, long state) {
         final byte target = targetStatus.getOrdinal();
-        while (!casRelTarget(state, target)) {
-            Thread.onSpinWait();
-            state = lpState();
-            if ((state & FLAG_REMOVED) != 0) return false;
-            if (getTargetStatus(state) != unloadedOrdinal) break;
-        }
-        return true;
+        if ((state & FLAG_REMOVED) != 0) return false;
+        return 0L == (FLAG_REMOVED & orRelState(1L << target));
     }
+     */
 
     public boolean addTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
         Objects.requireNonNull(ticket);
-        int state = lpState();
-        if ((state & FLAG_REMOVED) != 0 ||
-                getTargetStatus(state) == unloadedOrdinal && !rescueHolder(targetStatus, state)) {
-            return false;
+        long state;
+        /*
+        final boolean hasRescued;
+        if ((state & FLAG_REMOVED) == 0 && getTargetStatus(state) == unloadedOrdinal) {
+            hasRescued = true;
+            if (!rescueHolder(targetStatus, state)) return false;
+        } else {
+            hasRescued = false;
         }
-        final byte newTarget;
-        boolean success;
-        synchronized (this.tickets) {
+         */
+        final byte ordinal = targetStatus.getOrdinal();
+        block:
+        synchronized (this) {
             state = lpState();
             if ((state & FLAG_REMOVED) != 0) {
                 return false;
             }
-            final byte oldTarget = this.tickets.lpTargetStatus();
-            final boolean add = this.tickets.checkAdd(targetStatus, ticket);
-            if (!add) {
+            final var set = this.tickets[ordinal];
+            final boolean change = set.isEmpty();
+            if (!set.add(ticket)) {
                 throw new IllegalStateException("Ticket already exists");
             }
-            newTarget = this.tickets.addUnchecked(targetStatus);
-            if (oldTarget != newTarget) {
-                createFutures(oldTarget, newTarget);
+            if (!change) {
+                break block;
             }
-            success = updateTargetStatus(state, newTarget);
-        }
-        if (success) {
-            byte target = targetStatus.getOrdinal();
-            final byte current = getStatus(state);
-            final byte projected = getNextStatus(state);
-            if (current > target || (current == target && projected >= target)) {
-                ticket.consumeCallback();
+            state = setTargetRelease(ordinal);
+            if ((state & FLAG_REMOVED) != 0) {
+                return false;
+            }
+            final byte oldTarget = getTargetStatus(state);
+            Assertions.assertTrue(oldTarget != -1);
+            if (ordinal > oldTarget) {
+                createFutures(oldTarget, ordinal);
             }
         }
-        return success;
+        byte target = targetStatus.getOrdinal();
+        final byte current = getStatus(state);
+        if (current >= target) {
+            ticket.consumeCallback();
+        }
+        return true;
     }
 
     public void removeTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
         assertOpen();
         CompletableFuture<?>[] futuresToFail;
-        final byte newTarget;
-        synchronized (this.tickets) {
-            final byte oldTarget = this.tickets.lpTargetStatus();
-            final boolean remove = this.tickets.checkRemove(targetStatus, ticket);
-            if (!remove) {
+        final byte ordinal = targetStatus.getOrdinal();
+        synchronized (this) {
+            final var set = this.tickets[ordinal];
+            if (!set.remove(ticket)) {
                 throw new IllegalStateException("Ticket does not exist");
             }
-            newTarget = this.tickets.removeUnchecked(targetStatus);
-            // InitAuther97: target status is only changed by tickets thread
-            // which is properly synchronized via synchronized block
-            // Memory ordering: plain, check when removing synchronization
-            if (oldTarget == newTarget) {
+            if (!set.isEmpty()) {
                 return;
             }
+
+            final long mask = ~(1L << ordinal);
+            // InitAuther97: the affected futures are all masked by getFutureForStatus0 to UNLOADED_FUTURE.
+            // if they unfortunately modify the futures (inserting a new one), it will be completed exceptionally later.
+            // Release semantics is used here to support the use of state check as a synchronization point
+            final long oldState = lpState();
+            final byte oldTarget = getTargetStatus(oldState), newTarget = getTargetStatus(oldState & mask);
+
+            if (oldTarget == newTarget) {
+                unsetTargetRelease(ordinal);
+                return;
+            }
+
+            // InitAuther97: target status is only changed by tickets thread
+            // which is properly synchronized via synchronized block
+            // Memory ordering: release, check when removing synchronization
             futuresToFail = new CompletableFuture[oldTarget - newTarget];
             for (int i = newTarget + 1; i <= oldTarget; i++) {
                 // InitAuther97: use swap because of possible racing set.
                 // Acquire ensures that we see a properly initialized future.
                 // Writes to futures are all guarded with synchronization on ticket sets,
                 // so they are always witnessed in the program order.
-                final var swap = VH_FUTURES.getAndSetAcquire(this.futures, i, UNLOADED_FUTURE);
-                futuresToFail[i - newTarget - 1] = (CompletableFuture<?>) swap;
+                futuresToFail[i - newTarget - 1] = this.futures[i];
+                this.futures[i] = UNLOADED_FUTURE;
             }
-            // InitAuther97: the affected futures are all masked by getFutureForStatus0 to UNLOADED_FUTURE.
-            // if they unfortunately modify the futures (inserting a new one), it will be completed exceptionally later.
-            // Release semantics is used here to support the use of state check as a synchronization point
-            updateTargetStatus(lpState(), newTarget);
+            unsetTargetRelease(ordinal);
         }
+
         // InitAuther97: now we fail any future that either exists before removing
         // or gets stuffed into the array when removing
         // noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < futuresToFail.length; i++) {
-            final var future = futuresToFail[i];
-            if (future != null) future.completeExceptionally(UNLOADED_EXCEPTION);
+            futuresToFail[i].completeExceptionally(UNLOADED_EXCEPTION);
         }
     }
 
@@ -304,10 +317,17 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         op.whenComplete((_, _) -> this.busyRefCounter.decrementRefCount());
     }
 
-    public void subscribeOp(Completable op) {
+    public void subscribeOp(Completable op, StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
         assertOpen();
-        this.busyRefCounter.incrementRefCount();
-        op.onErrorComplete().subscribe(this.busyRefCounter::decrementRefCount);
+        setFlag(FLAG_DIRTY);
+        op.subscribe(() -> {
+            unlockScheduler();
+            scheduleTick(scheduler);
+        }, t -> {
+            unlockScheduler();
+            if (t instanceof SkipSchedulingException) return;
+            scheduleTick(scheduler);
+        });
     }
 
     BusyRefCounter busyRefCounter() {
@@ -352,11 +372,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         this.busyRefCounter.addListener(runnable);
     }
 
-    public void consolidateMarkDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
-        assertOpen();
-        this.busyRefCounter.addListenerOnce(() -> this.markDirty(scheduler));
-    }
-
     public Executor getCriticalSectionExecutor() {
         assertOpen();
         return this.criticalSectionExecutor;
@@ -379,23 +394,34 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     public boolean tryMarkDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
-        final int state = (int) VH_STATE.getAndBitwiseOrAcquire(this, FLAG_DIRTY);
+        long state = (long) VH_STATE.get(this);
         if ((state & FLAG_REMOVED) != 0) {
             return false;
         }
         if ((state & FLAG_DIRTY) != 0) {
             return true;
         }
+        state = (long) VH_STATE.getAndBitwiseOrAcquire(this, FLAG_DIRTY);
+        if ((state & FLAG_REMOVED) != 0) {
+            return false;
+        }
+        if ((state & FLAG_DIRTY) != 0) {
+            return true;
+        }
+        scheduleTick(scheduler);
+        return true;
+    }
+
+    private void scheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
         this.criticalSectionExecutor.execute(() -> {
-            VH_STATE.getAndBitwiseAndRelease(this, ~FLAG_DIRTY);
+            clearFlag(FLAG_DIRTY);
             scheduler.tickHolder0(this);
         });
-        return true;
     }
 
     /// Whether downgrading can proceed
     private boolean casStateDowngrade(byte toStatus) {
-        int state = loState();
+        long state = loState();
         if (getTargetStatus(state) > toStatus) {
             return false;
         }
@@ -410,7 +436,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     private void casStateAdvance(byte newStatus) {
-        int state = lpState();
+        long state = lpState();
         while (!casRelStatus(state, newStatus)) {
             Thread.onSpinWait();
             state = lpState();
@@ -420,7 +446,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     public boolean setStatusDowngrade(ItemStatus<K, V, Ctx> status) {
         assertOpen();
         final byte ordinal = status.getOrdinal();
-        final int state = lpState();
+        final long state = lpState();
         final var current = unloadedStatus.getAt(getStatus(state));
         Assertions.assertTrue(status.getNext() == current, "Invalid status downgrade");
         if (!casStateDowngrade(ordinal)) {
@@ -434,15 +460,15 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     public void setStatusAdvance(ItemStatus<K, V, Ctx> status, boolean isCancellation) {
         assertOpen();
+        final byte ordinal = status.getOrdinal();
         final var current = getStatus0();
         Assertions.assertTrue(status.getPrev() == current, "Invalid status upgrade");
         final ItemTicket[] ticketsToFire;
-        final CompletableFuture<?> futureToFire;
-        casStateAdvance(status.getOrdinal());
-        futureToFire = (CompletableFuture<?>) VH_FUTURES.getAcquire(this.futures, status.getOrdinal());
-        synchronized (this.tickets) {
-            ticketsToFire = this.tickets.getTicketsForStatus(status).toArray(ItemTicket[]::new);
+        synchronized (this) {
+            casStateAdvance(ordinal);
+            ticketsToFire = this.tickets[ordinal].toArray(ItemTicket[]::new);
         }
+        final var futureToFire = this.futures[ordinal];
         if (isCancellation) {
             Assertions.assertTrue(futureToFire != UNLOADED_FUTURE);
             Assertions.assertTrue(futureToFire == null || !futureToFire.isDone());
@@ -552,28 +578,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
      */
     public CompletableFuture<?> getFutureForStatus0(ItemStatus<K, V, Ctx> status) {
         final byte ordinal = status.getOrdinal();
-        int state = (int) VH_STATE.getAcquire(this);
-        final byte target = getTargetStatus(state);
-        final byte current = getStatus(state);
-        if (target < ordinal) {
-            return UNLOADED_FUTURE;
-        } else if (ordinal < current) {
-            return COMPLETED_VOID_FUTURE;
-        }
-        final var future = (CompletableFuture<?>) VH_FUTURES.get(this.futures, ordinal);
-        if (future != null) {
-            return future;
-        }
-        final var newFuture = new CompletableFuture<>();
-        final var witness = (CompletableFuture<?>) VH_FUTURES.compareAndExchangeRelease(this.futures, ordinal, null, newFuture);
-        if (witness != null) {
-            return witness;
-        }
-        state = (int) VH_STATE.getAcquire(this);
-        if (getStatus(state) >= ordinal) {
-            newFuture.complete(null);
-        }
-        return newFuture;
+        return this.futures[ordinal];
     }
 
     public void setItem(V item) {
@@ -602,12 +607,12 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     /// Access mode: plain
-    public int getFlagsPlain() {
-        return (int) VH_STATE.get(this) & ~(0xFF << ItemStatus.STATUS_SIZE * 3);
+    public long getFlagsPlain() {
+        return (long) VH_STATE.get(this) & -1 >>> Long.SIZE - ItemStatus.STATUS_LENGTH - ItemStatus.STATUS_SIZE * 2;
     }
 
     /// Access mode: plain
-    public void setFlag(int flag) {
+    public void setFlag(long flag) {
         assertOpen();
         // Make sure to use release if you want to broadcast changes via flags
         VH_STATE.getAndBitwiseOrAcquire(this, flag);
@@ -617,14 +622,14 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
      * Note: do not use this unless you know what you are doing
      * Access mode: plain
      */
-    public void clearFlag(int flag) {
+    public void clearFlag(long flag) {
         Assertions.assertTrue((flag & FLAG_REMOVED) == 0, "Cannot clear FLAG_REMOVED");
         assertOpen();
         VH_STATE.getAndBitwiseAndAcquire(this, ~flag);
     }
 
-    boolean release(int state) {
-        return VH_STATE.weakCompareAndSetAcquire(this, state, state | FLAG_REMOVED);
+    boolean release(long state) {
+        return VH_STATE.weakCompareAndSetAcquire(this, state, (state & ~FLAG_BUSY) | FLAG_REMOVED);
     }
 
     public void addDependencyTicket(StatusAdvancingScheduler<K, V, Ctx, ?> scheduler, K key, ItemStatus<K, V, Ctx> status, ItemTicket ticket) {

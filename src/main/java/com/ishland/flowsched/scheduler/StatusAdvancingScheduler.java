@@ -98,30 +98,37 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
     }
 
     void tickHolder0(ItemHolder<K, V, Ctx, UserData> holder) {
+        // May happen if removeTicket marks dirty too late while the holder is ticking
+        if (!holder.isOpen()) {
+            return;
+        }
         final K key = holder.getKey();
+        long state = holder.lpState();
+        if (!holder.tryLockSchedulerRelaxed()) {
+            if (ItemHolder.getNextStatus(state) != ItemHolder.getTargetStatus(state)) holder.tryCancelAction();
+            Thread.onSpinWait();
+            return;
+        }
 
-        final byte currentOrdinal = ItemHolder.getStatus(holder.lpState());
+        final byte currentOrdinal = ItemHolder.getStatus(state);
         final ItemStatus<K, V, Ctx> current = getUnloadedStatus().getAt(currentOrdinal);
         final byte unloadedOrdinal = getUnloadedStatus().getOrdinal();
         final ItemStatus<K, V, Ctx> nextStatus;
         final byte nextOrdinal;
-        int state;
-        while (true) {
+        for(int failures = 0;;failures++) {
             state = holder.loState();
             final byte targetOrdinal = ItemHolder.getTargetStatus(state);
             final ItemStatus<K, V, Ctx> next = getNextStatus(current, targetOrdinal);
             final byte nextOrdinal0 = next.getOrdinal();
-            if (holder.isBusy()) {
-                final byte projectedOrdinal = ItemHolder.getNextStatus(state);
-                if (projectedOrdinal != targetOrdinal) holder.tryCancelAction();
-                holder.consolidateMarkDirty(this);
-                return;
-            }
 //          holder.validateCompletedFutures(current);
 //          holder.sanitizeSetStatus = null;
             if (nextOrdinal0 != currentOrdinal) {
                 // Change of next status doesn't mean anything, we still use status change as the message
-                if (!ItemHolder.VH_STATE.weakCompareAndSetPlain(holder, state, ItemHolder.withNextStatus(state, nextOrdinal0))) continue;
+                if (!ItemHolder.VH_STATE.weakCompareAndSetPlain(holder, state,
+                        ItemHolder.undirty(ItemHolder.withNextStatus(state, nextOrdinal0)))) {
+                    for (int i = 0; i < failures; i++) Thread.onSpinWait();
+                    continue;
+                }
                 nextStatus = next;
                 nextOrdinal = nextOrdinal0;
                 break;
@@ -130,16 +137,21 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             // holder.validateAllFutures();
             if (currentOrdinal != unloadedOrdinal) {
                 holder.scheduleFlushDependencyCache(this);
+                holder.clearFlag(ItemHolder.FLAG_BUSY);
                 return;
             }
             if (holder.isDependencyDirty()) {
                 holder.scheduleFlushDependencyCache(this);
+                holder.clearFlag(ItemHolder.FLAG_BUSY);
                 holder.markDirty(this);
                 return;
             }
             Assertions.assertTrue(!holder.holdsDependency(), "BUG: %s still holds some dependencies when ready for unloading", holder.getKey());
 //          System.out.println("Unloaded: " + key);
-            if (!holder.release(state)) continue;
+            if (!holder.release(state)) {
+                for (int i = 0; i < failures; i++) Thread.onSpinWait();
+                continue;
+            }
             this.onItemRemoval(holder);
             final long lock = this.itemsLock.writeLock();
             try {
@@ -154,16 +166,11 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         Cancellable cancellable = new Cancellable();
         holder.submitAction(cancellable, nextStatus);
         Assertions.assertTrue(holder.getStatus0() == current);
-        holder.busyRefCounter().incrementRefCount();
-        try {
-            if (currentOrdinal < nextOrdinal) {
-                if ((state & ItemHolder.FLAG_BROKEN) != 0) return;
-                advanceStatus0(holder, nextStatus, cancellable);
-            } else {
-                downgradeStatus0(holder, current, nextStatus, cancellable);
-            }
-        } finally {
-            holder.busyRefCounter().decrementRefCount();
+        if (currentOrdinal < nextOrdinal) {
+            if ((state & ItemHolder.FLAG_BROKEN) != 0) return;
+            advanceStatus0(holder, nextStatus, cancellable);
+        } else {
+            downgradeStatus0(holder, current, nextStatus, cancellable);
         }
     }
 
@@ -176,19 +183,16 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         AtomicBoolean hasDowngraded = new AtomicBoolean(false);
 
         final Completable completable = Completable.defer(() -> {
-                    Assertions.assertTrue(holder.isBusy());
                     final Ctx ctx = makeContext(holder, current, dependencies, false);
                     Assertions.assertTrue(ctx != null);
                     contextRef.setPlain(ctx);
                     return current.preDowngradeFromThis(ctx, cancellable);
                 })
                 .andThen(Completable.defer(() -> {
-                    Assertions.assertTrue(holder.isBusy());
-
                     final boolean success = holder.setStatusDowngrade(nextStatus);
                     if (!success) {
                         cancellable.cancel();
-                        return Completable.error(Constant.CANCELLED);
+                        return Constant.FAILED_EMPTY_COMPLETABLE;
                     }
 
                     hasDowngraded.setPlain(true);
@@ -201,8 +205,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                 .doOnEvent((throwable) -> {
                     holder.finishAction();
                     try {
-                        Assertions.assertTrue(holder.isBusy());
-
                         {
                             Throwable actual = throwable;
                             while (actual instanceof CompletionException ex) actual = ex.getCause();
@@ -210,7 +212,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                                 if (hasDowngraded.getPlain()) {
                                     holder.setStatusAdvance(current, true);
                                 }
-                                holder.consolidateMarkDirty(this);
                                 return;
                             }
                         }
@@ -223,7 +224,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                                 clearDependencies0(holder, current);
                             }
                         }
-                        holder.consolidateMarkDirty(this);
                         onItemDowngrade(holder, nextStatus);
                     } catch (Throwable t) {
                         Throwable finalT;
@@ -237,7 +237,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                     }
                 });
 
-        holder.subscribeOp(completable);
+        holder.subscribeOp(completable, this);
     }
 
     private void advanceStatus0(ItemHolder<K, V, Ctx, UserData> holder, ItemStatus<K, V, Ctx> nextStatus, Cancellable cancellation) {
@@ -256,7 +256,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
 
         final Completable completable = getDependencyFuture0(dependencies, holder, nextStatus, depCancellable)
                 .andThen(Completable.defer(() -> {
-                    Assertions.assertTrue(holder.isBusy());
                     final Ctx ctx = makeContext(holder, nextStatus, dependencies, true);
                     Assertions.assertTrue(ctx != null);
                     contextRef.setPlain(ctx);
@@ -264,7 +263,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                 }))
                 .onErrorResumeNext(throwable -> {
                     try {
-                        Assertions.assertTrue(holder.isBusy());
 
                         {
                             Throwable actual = throwable;
@@ -273,7 +271,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                                 if (holder.getDependencies(nextStatus) != null) {
                                     releaseDependencies(holder, nextStatus);
                                 }
-                                holder.consolidateMarkDirty(this);
                                 return Completable.error(throwable);
                             }
                         }
@@ -283,12 +280,11 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                         final ExceptionHandlingAction action = this.tryHandleTransactionException(holder, nextStatus, true, throwable);
                         switch (action) {
                             case PROCEED -> {
-                                return Completable.complete();
+                                return Completable.error(new SkipSchedulingException(throwable));
                             }
                             case MARK_BROKEN -> {
                                 holder.setFlag(ItemHolder.FLAG_BROKEN);
                                 clearDependencies0(holder, nextStatus);
-                                holder.consolidateMarkDirty(this);
                                 return Completable.error(throwable);
                             }
                             default -> throw new IllegalStateException("Unexpected value: " + action);
@@ -296,9 +292,9 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                     } catch (Throwable t) {
                         if (throwable != null) {
                             throwable.addSuppressed(t);
-                            return Completable.error(throwable);
+                            return Completable.error(new SkipSchedulingException(throwable));
                         } else {
-                            return Completable.error(t);
+                            return Completable.error(new SkipSchedulingException(t));
                         }
                     }
                 })
@@ -307,14 +303,12 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                         if (throwable == null) {
                             holder.setStatusAdvance(nextStatus, false);
                             rerequestDependencies(holder, nextStatus);
-                            holder.consolidateMarkDirty(this);
                             onItemUpgrade(holder, nextStatus);
                         }
                     } catch (Throwable t) {
                         try {
                             holder.setFlag(ItemHolder.FLAG_BROKEN);
                             clearDependencies0(holder, nextStatus);
-                            holder.consolidateMarkDirty(this);
                         } catch (Throwable t1) {
                             t.addSuppressed(t1);
                         }
@@ -334,32 +328,23 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                                     final ExceptionHandlingAction action = this.tryHandleTransactionException(holder, nextStatus, true, throwable);
                                     switch (action) {
                                         case PROCEED -> {
-                                            return Completable.complete();
                                         }
                                         case MARK_BROKEN -> {
                                             holder.setFlag(ItemHolder.FLAG_BROKEN);
-                                            holder.consolidateMarkDirty(this);
                                             holder.executeCriticalSectionAndBusy(() -> {
-                                                holder.busyRefCounter().incrementRefCount();
                                                 // TODO: better broken downgrade handling
                                                 final var cancellation1 = Cancellable.COMPLETED;
                                                 holder.submitAction(cancellation1, nextStatus.getPrev());
-                                                try {
-                                                    downgradeStatus0(holder, nextStatus, nextStatus.getPrev(), cancellation1);
-                                                } finally {
-                                                    holder.busyRefCounter().decrementRefCount();
-                                                }
+                                                downgradeStatus0(holder, nextStatus, nextStatus.getPrev(), cancellation1);
                                             });
-                                            return Completable.error(throwable);
                                         }
                                         default -> throw new IllegalStateException("Unexpected value: " + action);
                                     }
+                                    return Completable.error(new SkipSchedulingException(throwable));
                                 })
                 )
-                .onErrorComplete()
                 .cache();
-        holder.subscribeOp(completable);
-        Assertions.assertTrue(holder.isBusy() || (upgradeCancellable.isCancelled() || holder.getStatus0() == nextStatus));
+        holder.subscribeOp(completable, this);
     }
 
     private void rerequestDependencies(ItemHolder<K, V, Ctx, UserData> holder, ItemStatus<K, V, Ctx> status) { // sync externally
@@ -480,10 +465,10 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         }
 
         return Completable.create(emitter -> {
-            AtomicInteger finished = new AtomicInteger();
+            AtomicInteger finished = new AtomicInteger(dependencies.length);
             holder.setDependencies(nextStatus, dependencies);
             cancellable.setup(() -> {
-                if (finished.getAndSet(0) > 0) {
+                if (finished.getAndSet(-1) > 0) {
                     releaseDependencies(holder, nextStatus);
                     holder.scheduleFlushDependencyCache(this); // avoid dep cache poison due to partial upgrades when cancelled
                     emitter.onError(Constant.CANCELLED);
@@ -491,7 +476,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             });
             try {
                 Runnable callback = () -> {
-                    if (finished.getAndAdd(-1) == 0) {
+                    if (finished.getAndAdd(-1) == 1) {
                         cancellable.complete();
                         holder.getCriticalSectionExecutor().execute(emitter::onComplete);
                     }
@@ -502,7 +487,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                 }
             } catch (Throwable t) {
                 t.printStackTrace();
-                if (finished.getAndSet(0) > 0) {
+                if (finished.getAndSet(-1) > 0) {
                     releaseDependencies(holder, nextStatus);
                     holder.scheduleFlushDependencyCache(this); // avoid dep cache poison due to partial upgrades when cancelled
                     emitter.onError(t);
@@ -534,7 +519,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             do {
                 holder = this.getOrCreateHolder(key);
             } while (!holder.addTicket(targetStatus, ticket)); // Holder is removed before we had chance to add a ticket to it, retry
-            holder.consolidateMarkDirty(this);
+            holder.tryMarkDirty(this);
             return holder;
         } catch (Throwable t) {
             t.printStackTrace();

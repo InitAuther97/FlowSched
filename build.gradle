@@ -46,6 +46,7 @@ dependencies {
 }
 
 test {
+    jvmArgs += "-Xmx4G"
     jvmArgs "-javaagent:${configurations.mockitoAgent.asPath}"
     useJUnitPlatform()
     finalizedBy jacocoTestReport

@@ -15,7 +15,7 @@ public interface ItemStatus<K, V, Ctx> {
     @SuppressWarnings("rawtypes")
     KeyStatusPair[] EMPTY_DEPENDENCIES = new KeyStatusPair[0];
 
-    byte STATUS_SIZE = 8, STATUS_MASK = Byte.MAX_VALUE;
+    byte STATUS_SIZE = 5, STATUS_MASK = 0x1F, STATUS_LENGTH = 1 << STATUS_SIZE;
 
     @SuppressWarnings("unchecked")
     static <K, V, Ctx> KeyStatusPair<K, V, Ctx>[] emptyDependencies() {
