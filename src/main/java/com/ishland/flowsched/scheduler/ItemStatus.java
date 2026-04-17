@@ -61,7 +61,7 @@ public interface ItemStatus<K, V, Ctx> {
     /**
      * @implNote cancelling the given cancellable here is discouraged. If implementations do cancel here, postUpgrade hook will not be called after this.
      */
-    Completable downgradeFromThis(Ctx context, Cancellable cancellable);
+    Completable downgradeFromThis(Ctx context);
 
     /**
      * Get the dependencies of the given item at the given status.

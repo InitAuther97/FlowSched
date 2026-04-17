@@ -130,7 +130,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                     for (int i = 0; i < failures; i++) Thread.onSpinWait();
                     continue;
                 }
-                System.out.println(key + " going from " + current + " to " + next);
                 nextStatus = next;
                 nextOrdinal = nextOrdinal0;
                 break;
@@ -200,7 +199,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
 
                     final Ctx ctx = contextRef.getPlain();
                     Objects.requireNonNull(ctx);
-                    final Completable stage = current.downgradeFromThis(ctx, cancellable);
+                    final Completable stage = current.downgradeFromThis(ctx);
                     return stage.cache();
                 }))
                 .doOnEvent((throwable) -> {

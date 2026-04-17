@@ -20,10 +20,9 @@ import static com.ishland.flowsched.util.Constant.*;
 
 @SuppressWarnings("unused")
 class ItemHolderHotField {
-    public static final long FLAG_FREE = 1L << 45;
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
     /// flag_busy (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
-    protected volatile long state = 1 | FLAG_FREE; // Core synchronization point, responsible for upgrade/downgrade/future
+    protected volatile long state; // Core synchronization point, responsible for upgrade/downgrade/future
     private long l11, l12, l13, l14, l15, l16, l17; // padding
 }
 
@@ -42,6 +41,8 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     public static final long FLAG_BROKEN = 1L << 43;
 
     public static final long FLAG_DIRTY = 1L << 44;
+
+    public static final long FLAG_FREE = 1L << 45;
 
     static {
         try {
@@ -98,6 +99,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             Arrays.fill(refCnt, -1);
             return refCnt;
         };
+        VH_STATE.set(this, 1 | FLAG_FREE);
         // InitAuther97: no fullFence slop
         // VarHandle.fullFence();
     }
@@ -595,12 +597,13 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     public void clearFlag(long flag) {
         Assertions.assertTrue((flag & FLAG_REMOVED) == 0, "Cannot clear FLAG_REMOVED");
         assertOpen();
-        VH_STATE.getAndBitwiseAndAcquire(this, ~flag);
+        andStatePlain(~flag);
     }
 
     boolean release(long state) {
-        // Don't change it to getAndBitwiseOr, as logic in add/remove ticket never checked for availability!
-        // We are not in a hurry to remove a holder! Otherwise, we are just pissing in the wind!
+        // Don't change it to getAndBitwiseOr, as logic in add/remove ticket never checked for holder's availability
+        // We are not in a hurry to remove a holder! Ticket operations are complex enough!
+        // If you bear to do this, you are just pissing in the wind!
         return VH_STATE.weakCompareAndSetAcquire(this, state, state | FLAG_FREE | FLAG_REMOVED);
     }
 

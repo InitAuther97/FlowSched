@@ -62,7 +62,7 @@ public enum TestStatus implements ItemStatus<Long, TestItem, TestContext>, Compa
 
 
     @Override
-    public Completable downgradeFromThis(TestContext context, Cancellable cancellable) {
+    public Completable downgradeFromThis(TestContext context) {
         if ((context.rng() & 1) == 0) {
             Assertions.assertTrue(false, "erroneous call to downgradeFromThis");
         }

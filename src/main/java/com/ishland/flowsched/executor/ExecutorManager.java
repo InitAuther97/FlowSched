@@ -47,7 +47,7 @@ public class ExecutorManager {
         globalWorkQueue = new DynamicPriorityTaskQueue<>(priorityCount);
         workerThreads = new WorkerThread[workerThreadCount];
         // InitAuther97: make sure work queue is fully initialized before workers are started
-        VarHandle.storeStoreFence();
+        VarHandle.fullFence();
         for (int i = 0; i < workerThreadCount; i++) {
             final WorkerThread thread = new WorkerThread(this);
             threadInitializer.accept(thread);
