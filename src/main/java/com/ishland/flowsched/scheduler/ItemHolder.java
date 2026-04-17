@@ -21,7 +21,7 @@ import static com.ishland.flowsched.util.Constant.*;
 
 @SuppressWarnings("unused")
 class ItemHolderHotField {
-    private long l0, l1, l2, l3, l4, l5, l6, l7;
+    // private long l0, l1, l2, l3, l4, l5, l6, l7;
     /// flag_scheduler (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
     protected volatile long state = 1; // Core synchronization point, responsible for upgrade/downgrade/future
     private long l11, l12, l13, l14, l15, l16, l17; // padding
@@ -163,12 +163,12 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     /**
      * Not thread-safe, protect with statusMutex
      */
-    private void createFutures(byte from, byte to) {
+    private void createFutures(byte from, byte to, byte status) {
         for (int i = from + 1; i <= to; i++) {
             if (this.futures[i] != UNLOADED_FUTURE) {
                 failCreateFutures(this.futures[i]);
             }
-            final var future = new CompletableFuture<>();
+            final var future = i <= status ? COMPLETED_VOID_FUTURE : new CompletableFuture<>();
             // InitAuther97: CompletableFuture does nothing in its constructor,
             // therefore it is guaranteed by JVM to be well initialized when shared
             // VarHandle.storeStoreFence(); // ensure visibility
@@ -248,9 +248,10 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
                 return false;
             }
             final byte oldTarget = getTargetStatus(state);
+            final byte status = getStatus(state);
             Assertions.assertTrue(oldTarget != -1);
             if (ordinal > oldTarget) {
-                createFutures(oldTarget, ordinal);
+                createFutures(oldTarget, ordinal, status);
             }
         }
         byte target = targetStatus.getOrdinal();
