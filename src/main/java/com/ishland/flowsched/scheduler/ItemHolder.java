@@ -20,9 +20,10 @@ import static com.ishland.flowsched.util.Constant.*;
 
 @SuppressWarnings("unused")
 class ItemHolderHotField {
+    public static final long FLAG_FREE = 1L << 45;
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
     /// flag_busy (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
-    protected volatile long state = 1; // Core synchronization point, responsible for upgrade/downgrade/future
+    protected volatile long state = 1 | FLAG_FREE; // Core synchronization point, responsible for upgrade/downgrade/future
     private long l11, l12, l13, l14, l15, l16, l17; // padding
 }
 
@@ -41,8 +42,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     public static final long FLAG_BROKEN = 1L << 43;
 
     public static final long FLAG_DIRTY = 1L << 44;
-
-    public static final long FLAG_BUSY = 1L << 45;
 
     static {
         try {
@@ -192,12 +191,15 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     boolean tryLockSchedulerRelaxed() {
         long state = (long) VH_STATE.get(this);
-        if ((state & FLAG_BUSY) != 0) return false;
-        return casStatePlain(state, state | FLAG_BUSY);
+        if ((state & FLAG_FREE) == 0) return false;
+        return casStatePlain(state, state & ~FLAG_FREE);
     }
 
-    void unlockScheduler() {
-        andStatePlain(~FLAG_BUSY);
+    void rescheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, boolean skipScheduling) {
+        long state = setFlag(skipScheduling ? FLAG_FREE : FLAG_FREE | FLAG_DIRTY);
+        if (!skipScheduling && (state & FLAG_DIRTY) == 0) {
+            scheduleTick(scheduler);
+        }
     }
 
     public ItemStatus<K, V, Ctx> changingStatusTo() {
@@ -310,15 +312,10 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     public void subscribeOp(Completable op, StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
         assertOpen();
-        setFlag(FLAG_DIRTY);
-        op.subscribe(() -> {
-            unlockScheduler();
-            scheduleTick(scheduler);
-        }, t -> {
-            unlockScheduler();
-            if (t instanceof SkipSchedulingException) return;
-            scheduleTick(scheduler);
-        });
+        op.subscribe(
+                () -> rescheduleTick(scheduler, false),
+                t -> rescheduleTick(scheduler, t instanceof SkipSchedulingException)
+        );
     }
 
     // sync externally
@@ -423,7 +420,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return true;
     }
 
-    public void setStatusAdvance(ItemStatus<K, V, Ctx> status, boolean isCancellation) {
+    public void setStatusAdvance(ItemStatus<K, V, Ctx> status) {
         assertOpen();
         final byte ordinal = status.getOrdinal();
         final var current = getStatus0();
@@ -434,15 +431,23 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             ticketsToFire = this.tickets[ordinal].toArray(ItemTicket[]::new);
         }
         final var futureToFire = this.futures[ordinal];
-        if (isCancellation) {
-            Assertions.assertTrue(futureToFire != UNLOADED_FUTURE);
-            Assertions.assertTrue(futureToFire == null || !futureToFire.isDone());
-        }
         //noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < ticketsToFire.length; i++) {
             ticketsToFire[i].consumeCallback();
         }
-        if (futureToFire != null) futureToFire.complete(null);
+        futureToFire.complete(null);
+    }
+
+    public void setStatusForDowngradeCancellation(ItemStatus<K, V, Ctx> status) {
+        assertOpen();
+        final byte ordinal = status.getOrdinal();
+        final var current = getStatus0();
+        Assertions.assertTrue(status.getPrev() == current, "Invalid status upgrade");
+        casStateAdvance(ordinal);
+        final var futureToFire = this.futures[ordinal];
+        Assertions.assertTrue(futureToFire != UNLOADED_FUTURE);
+        Assertions.assertTrue(!futureToFire.isDone());
+        futureToFire.complete(null);
     }
 
     public ItemStatus<K, V, Ctx> getStatus() {
@@ -577,10 +582,10 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     /// Access mode: plain
-    public void setFlag(long flag) {
+    public long setFlag(long flag) {
         assertOpen();
         // Make sure to use release if you want to broadcast changes via flags
-        VH_STATE.getAndBitwiseOrAcquire(this, flag);
+        return (long) VH_STATE.getAndBitwiseOrAcquire(this, flag);
     }
 
     /**
@@ -594,7 +599,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     boolean release(long state) {
-        return VH_STATE.weakCompareAndSetAcquire(this, state, (state & ~FLAG_BUSY) | FLAG_REMOVED);
+        // Don't change it to getAndBitwiseOr, as logic in add/remove ticket never checked for availability!
+        // We are not in a hurry to remove a holder! Otherwise, we are just pissing in the wind!
+        return VH_STATE.weakCompareAndSetAcquire(this, state, state | FLAG_FREE | FLAG_REMOVED);
     }
 
     public void addDependencyTicket(StatusAdvancingScheduler<K, V, Ctx, ?> scheduler, K key, ItemStatus<K, V, Ctx> status, ItemTicket ticket) {

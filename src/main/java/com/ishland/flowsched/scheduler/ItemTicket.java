@@ -56,6 +56,7 @@ public class ItemTicket {
         }
         VarHandle.acquireFence();
         final var callback = this.callback;
+        if (callback == null) return;
         this.callback = null;
         callback.run();
     }
