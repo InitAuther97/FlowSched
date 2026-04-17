@@ -2,21 +2,30 @@ package com.ishland.flowsched.scheduler;
 
 import com.ishland.flowsched.util.Assertions;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 public class ItemTicket {
 
-    private static final AtomicReferenceFieldUpdater<ItemTicket, Runnable> CALLBACK_UPDATER = AtomicReferenceFieldUpdater.newUpdater(ItemTicket.class, Runnable.class, "callback");
-    private static final AtomicIntegerFieldUpdater<ItemTicket> CONSUMPTION_UPDATER = AtomicIntegerFieldUpdater.newUpdater(ItemTicket.class, "consumptions");
+    private static final VarHandle VH_CONSUMPTIONS;
+
+    static {
+        try {
+            final var lookup = MethodHandles.lookup();
+            VH_CONSUMPTIONS = lookup.findVarHandle(ItemTicket.class, "consumptions", int.class);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     private final int hashCode;
     private final TicketType type;
     private final Object source;
-    private volatile Runnable callback = null;
+    private Runnable callback;
     private volatile int consumptions;
-//    private int hash = 0;
 
     public ItemTicket(TicketType type, Object source, Runnable callback) {
         this(type, source, callback, 1);
@@ -40,18 +49,15 @@ public class ItemTicket {
     }
 
     public void consumeCallback() {
-        int counter = CONSUMPTION_UPDATER.decrementAndGet(this);
-        Assertions.assertTrue(counter >= 0, "Counter underflow");
-        if (counter == 0) {
-            Runnable callback = CALLBACK_UPDATER.getAndSet(this, null);
-            if (callback != null) {
-                try {
-                    callback.run();
-                } catch (Throwable t) {
-                    t.printStackTrace();
-                }
-            }
+        int counter = (int) VH_CONSUMPTIONS.getAndAddRelease(this, -1);
+        Assertions.assertTrue(counter > 0, "Counter underflow");
+        if (counter > 1) {
+            return;
         }
+        VarHandle.acquireFence();
+        final var callback = this.callback;
+        this.callback = null;
+        callback.run();
     }
 
     @Override

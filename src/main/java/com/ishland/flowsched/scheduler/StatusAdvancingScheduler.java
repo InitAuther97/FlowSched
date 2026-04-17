@@ -107,6 +107,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         if (!holder.tryLockSchedulerRelaxed()) {
             if (ItemHolder.getNextStatus(state) != ItemHolder.getTargetStatus(state)) holder.tryCancelAction();
             Thread.onSpinWait();
+            holder.markDirty(this);
             return;
         }
 
@@ -465,10 +466,10 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         }
 
         return Completable.create(emitter -> {
-            AtomicInteger finished = new AtomicInteger(dependencies.length);
+            AtomicBoolean finished = new AtomicBoolean(false);
             holder.setDependencies(nextStatus, dependencies);
             cancellable.setup(() -> {
-                if (finished.getAndSet(-1) > 0) {
+                if (!finished.getAndSet(true)) {
                     releaseDependencies(holder, nextStatus);
                     holder.scheduleFlushDependencyCache(this); // avoid dep cache poison due to partial upgrades when cancelled
                     emitter.onError(Constant.CANCELLED);
@@ -476,18 +477,19 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             });
             try {
                 Runnable callback = () -> {
-                    if (finished.getAndAdd(-1) == 1) {
+                    if (!finished.getAndSet(true)) {
                         cancellable.complete();
                         holder.getCriticalSectionExecutor().execute(emitter::onComplete);
                     }
                 };
+                final ItemTicket ticket = new ItemTicket(ItemTicket.TicketType.DEPENDENCY, holder.getKey(), callback, dependencies.length);
                 for (KeyStatusPair<K, V, Ctx> dependency : dependencies) {
                     Assertions.assertTrue(!dependency.key().equals(holder.getKey()));
-                    holder.addDependencyTicket(this, dependency.key(), dependency.status(), new ItemTicket(ItemTicket.TicketType.DEPENDENCY, holder.getKey(), callback));
+                    holder.addDependencyTicket(this, dependency.key(), dependency.status(), ticket);
                 }
             } catch (Throwable t) {
                 t.printStackTrace();
-                if (finished.getAndSet(-1) > 0) {
+                if (!finished.getAndSet(true)) {
                     releaseDependencies(holder, nextStatus);
                     holder.scheduleFlushDependencyCache(this); // avoid dep cache poison due to partial upgrades when cancelled
                     emitter.onError(t);

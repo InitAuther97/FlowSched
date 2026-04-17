@@ -13,7 +13,6 @@ import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 
@@ -22,7 +21,7 @@ import static com.ishland.flowsched.util.Constant.*;
 @SuppressWarnings("unused")
 class ItemHolderHotField {
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
-    /// flag_scheduler (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
+    /// flag_busy (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
     protected volatile long state = 1; // Core synchronization point, responsible for upgrade/downgrade/future
     private long l11, l12, l13, l14, l15, l16, l17; // padding
 }
@@ -58,7 +57,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     private final K key;
     private final ItemStatus<K, V, Ctx> unloadedStatus;
     private final byte unloadedOrdinal;
-    private final BusyRefCounter busyRefCounter = new BusyRefCounter();
     private final Set<ItemTicket>[] tickets;
 //  private final List<Pair<ItemStatus<K, V, Ctx>, Long>> statusHistory = ReferenceLists.synchronize(new ReferenceArrayList<>());
     private final KeyStatusPair<K, V, Ctx>[][] requestedDependencies;
@@ -310,14 +308,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
     }
 
-    public void submitOp(CompletionStage<Void> op) {
-        assertOpen();
-//        this.opFuture.set(opFuture.get().thenCombine(op, (a, b) -> null).handle((o, throwable) -> null));
-//        this.opFuture.getAndUpdate(future -> future.thenCombine(op, (a, b) -> null).handle((o, throwable) -> null));
-        this.busyRefCounter.incrementRefCount();
-        op.whenComplete((_, _) -> this.busyRefCounter.decrementRefCount());
-    }
-
     public void subscribeOp(Completable op, StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
         assertOpen();
         setFlag(FLAG_DIRTY);
@@ -329,10 +319,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             if (t instanceof SkipSchedulingException) return;
             scheduleTick(scheduler);
         });
-    }
-
-    BusyRefCounter busyRefCounter() {
-        return this.busyRefCounter;
     }
 
     // sync externally
@@ -358,21 +344,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
     }
 
-    public CompletableFuture<?> getOpFuture() { // best-effort
-        assertOpen();
-        if (!this.busyRefCounter.isBusy()) {
-            return COMPLETED_VOID_FUTURE;
-        }
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        this.busyRefCounter.addListener(() -> future.complete(null));
-        return future;
-    }
-
-    public void submitOpListener(Runnable runnable) {
-        assertOpen();
-        this.busyRefCounter.addListener(runnable);
-    }
-
     public Executor getCriticalSectionExecutor() {
         assertOpen();
         return this.criticalSectionExecutor;
@@ -380,14 +351,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     public void executeCriticalSectionAndBusy(Runnable command) {
         assertOpen();
-        this.busyRefCounter().incrementRefCount();
-        this.getCriticalSectionExecutor().execute(() -> {
-            try {
-                command.run();
-            } finally {
-                this.busyRefCounter().decrementRefCount();
-            }
-        });
+        this.getCriticalSectionExecutor().execute(command);
     }
 
     public void markDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
