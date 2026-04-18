@@ -99,7 +99,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             Arrays.fill(refCnt, -1);
             return refCnt;
         };
-        VH_STATE.setVolatile(this, 1 | FLAG_FREE);
+        VH_STATE.set(this, 1 | FLAG_FREE);
         // InitAuther97: no fullFence slop
         // VarHandle.fullFence();
     }
@@ -208,6 +208,18 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         assertOpen();
         final Pair<Cancellable, ItemStatus<K, V, Ctx>> pair = this.runningAction;
         return pair != null ? pair.right() : null;
+    }
+
+    ItemHolder<K, V, Ctx, UserData>[] allUnreachedDeps(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, int ordinal) {
+        final var array = this.requestedDependencies[ordinal];
+        if (array == null) return new ItemHolder[0];
+        final var result = new ItemHolder[array.length];
+        for (int i = 0; i < array.length; i++) {
+            final var holder = scheduler.getHolder(array[i].key());
+            if (holder.getStatus().getOrdinal() >= ordinal) continue;
+            result[i] = holder;
+        }
+        return result;
     }
 
     /*

@@ -72,7 +72,7 @@ public class ExecutorManager {
                 final FreeableTaskList present = this.lockListeners.putIfAbsent(token, listenerSet);
                 if (present != null) {
                     for (int j = 0; j < i; j++) {
-                        this.lockListeners.remove(lockTokens[j], listenerSet);
+                        Assertions.assertTrue(this.lockListeners.remove(lockTokens[j], listenerSet));
                     }
                     callListeners(listenerSet); // synchronizes
                     synchronized (present) {
@@ -115,11 +115,11 @@ public class ExecutorManager {
     private void callListeners(FreeableTaskList listeners) {
         synchronized (listeners) {
             listeners.freed = true;
-            if (listeners.isEmpty()) return;
-            for (Task listener : listeners) {
-                listener.reset();
-                this.schedule0(listener, listener.pendingPriority);
-            }
+        }
+        if (listeners.isEmpty()) return;
+        for (Task listener : listeners) {
+            listener.reset();
+            this.schedule0(listener, listener.pendingPriority);
         }
     }
 
@@ -199,6 +199,19 @@ public class ExecutorManager {
 
         private boolean freed = false;
 
+        @Override
+        public boolean equals(Object o) {
+            // InitAuther97: force identity comparison
+            // Maps may use equals() to compare value when removing a given K-V pair
+            // It's our intention to use identity comparison, force it here!
+            return this == o;
+        }
+
+        @Override
+        public int hashCode() {
+            // InitAuther97: force identity comparison
+            return System.identityHashCode(this);
+        }
     }
 
 }
