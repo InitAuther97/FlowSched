@@ -44,13 +44,13 @@ public class WorkerThread extends Thread {
             AtomicBoolean released = new AtomicBoolean(false);
             try {
                 task.run(() -> {
-                    if (released.compareAndExchangeAcquire(false, true)) {
+                    if (!released.compareAndExchangeAcquire(false, true)) {
                         executorManager.releaseLocks(task);
                     }
                 });
             } catch (Throwable t) {
                 try {
-                    if (released.compareAndExchangeAcquire(false, true)) {
+                    if (!released.compareAndExchangeAcquire(false, true)) {
                         executorManager.releaseLocks(task);
                     }
                 } catch (Throwable t1) {
