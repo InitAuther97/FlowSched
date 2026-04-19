@@ -3,7 +3,6 @@ package com.ishland.flowsched.scheduler;
 import com.ishland.flowsched.structs.OneTaskAtATimeExecutor;
 import com.ishland.flowsched.util.Assertions;
 import io.reactivex.rxjava3.core.Completable;
-import it.unimi.dsi.fastutil.Pair;
 import it.unimi.dsi.fastutil.objects.*;
 
 import java.lang.invoke.MethodHandles;
@@ -23,13 +22,15 @@ class ItemHolderHotField {
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
     /// flag_busy (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
     protected volatile long state; // Core synchronization point, responsible for upgrade/downgrade/future
-    private long l11, l12, l13, l14, l15, l16, l17; // padding
+    protected volatile int schedulerState;
+    private int i1;
+    private long l12, l13, l14, l15, l16, l17; // padding
 }
 
 public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     // private static final VarHandle VH_SCHEDULED_DIRTY;
-    static final VarHandle VH_STATE;
+    static final VarHandle VH_STATE, VH_SCHEDULER_STATE;
 
     public static final long FLAG_REMOVED = 1L << 42;
     /**
@@ -49,15 +50,18 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             final var lookup = MethodHandles.lookup();
             // VH_SCHEDULED_DIRTY = lookup.findVarHandle(ItemHolder.class, "scheduledDirty", int.class);
             VH_STATE = lookup.findVarHandle(ItemHolder.class, "state", long.class);
+            VH_SCHEDULER_STATE = lookup.findVarHandle(ItemHolder.class, "schedulerState", int.class);
         } catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
     }
 
     private final K key;
+    private UserData userData; // Stable value
     private final ItemStatus<K, V, Ctx> unloadedStatus;
     private final byte unloadedOrdinal;
-    private final Set<ItemTicket>[] tickets;
+    private final OneTaskAtATimeExecutor criticalSectionExecutor;
+
 //  private final List<Pair<ItemStatus<K, V, Ctx>, Long>> statusHistory = ReferenceLists.synchronize(new ReferenceArrayList<>());
     private final KeyStatusPair<K, V, Ctx>[][] requestedDependencies;
     private final Object2ReferenceLinkedOpenHashMap<K, int[]> dependencyRefCnts = new Object2ReferenceLinkedOpenHashMap<>() {
@@ -69,13 +73,12 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
     };
     private final Object2ReferenceFunction<K, int[]> depRefCntCreate;
-    private final OneTaskAtATimeExecutor criticalSectionExecutor;
-
-    private final CompletableFuture<?>[] futures; // Futures to fire by setStatus, only written by ticket ops threads
-    private V item; // Piggyback on state read when read off scheduler threads
-    private UserData userData; // Stable value
-    private Pair<Cancellable, ItemStatus<K, V, Ctx>> runningAction = null; // Only used by scheduler threads
     private boolean dependencyDirty = false; // Used in dependency critical section
+
+    private final Set<ItemTicket>[] tickets;
+    private final CompletableFuture<?>[] futures; // Futures to fire by setStatus, only written by ticket ops threads
+    private V item; // Piggyback on future when read off scheduler threads
+    private Cancellable runningAction = null; // Only used by scheduler threads
 
     ItemHolder(ItemStatus<K, V, Ctx> initialStatus, K key, ObjectFactory objectFactory, Executor backgroundExecutor) {
         this.unloadedStatus = Objects.requireNonNull(initialStatus);
@@ -197,17 +200,16 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return casStatePlain(state, state & ~FLAG_FREE);
     }
 
+    void lockScheduler() {
+        long state = (long) VH_STATE.getAndBitwiseAndAcquire(this, ~FLAG_FREE);
+        Assertions.assertTrue((state & FLAG_FREE) != 0, "Scheduler is busy when lockScheduler occurs");
+    }
+
     void rescheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, boolean skipScheduling) {
         long state = setFlag(skipScheduling ? FLAG_FREE : FLAG_FREE | FLAG_DIRTY);
         if (!skipScheduling && (state & FLAG_DIRTY) == 0) {
             scheduleTick(scheduler);
         }
-    }
-
-    public ItemStatus<K, V, Ctx> changingStatusTo() {
-        assertOpen();
-        final Pair<Cancellable, ItemStatus<K, V, Ctx>> pair = this.runningAction;
-        return pair != null ? pair.right() : null;
     }
 
     ItemHolder<K, V, Ctx, UserData>[] allUnreachedDeps(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, int ordinal) {
@@ -216,7 +218,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         final var result = new ItemHolder[array.length];
         for (int i = 0; i < array.length; i++) {
             final var holder = scheduler.getHolder(array[i].key());
-            if (holder.getStatus().getOrdinal() >= ordinal) continue;
+            if (holder.getStatus().getOrdinal() >= ordinal - 1) continue;
             result[i] = holder;
         }
         return result;
@@ -340,29 +342,24 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     // sync externally
-    public void submitAction(Cancellable cancellation, ItemStatus<K, V, Ctx> status) {
+    public void submitAction(Cancellable cancellation) {
         assertOpen();
         Assertions.assertTrue(this.runningAction == null, "Only one action can happen at a time");
-        this.runningAction = Pair.of(cancellation, status);
+        this.runningAction = cancellation;
     }
 
     // sync externally
     public void tryCancelAction() {
         assertOpen();
-        final Pair<Cancellable, ItemStatus<K, V, Ctx>> signaller = this.runningAction;
+        final Cancellable signaller = this.runningAction;
         if (signaller != null) {
-            signaller.left().cancel();
+            signaller.cancel();
         }
     }
 
     public Executor getCriticalSectionExecutor() {
         assertOpen();
         return this.criticalSectionExecutor;
-    }
-
-    public void executeCriticalSectionAndBusy(Runnable command) {
-        assertOpen();
-        this.getCriticalSectionExecutor().execute(command);
     }
 
     public void markDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
@@ -663,10 +660,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
             }
             return false;
         }
-    }
-
-    public void scheduleFlushDependencyCache(StatusAdvancingScheduler<K, V, Ctx, ?> scheduler) {
-        this.executeCriticalSectionAndBusy(() -> this.flushDependencyCache0(scheduler));
     }
 
     public void flushDependencyCache0(StatusAdvancingScheduler<K, V, Ctx, ?> scheduler) {

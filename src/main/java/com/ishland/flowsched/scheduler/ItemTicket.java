@@ -40,6 +40,10 @@ public class ItemTicket {
         this.hashCode = this.hashCode0();
     }
 
+    public void setCallback(Runnable callback) {
+        this.callback = callback;
+    }
+
     public Object getSource() {
         return this.source;
     }

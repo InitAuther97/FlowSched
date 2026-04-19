@@ -2,7 +2,10 @@ package com.ishland.flowsched.executor;
 
 import com.ishland.flowsched.util.Assertions;
 import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -12,9 +15,21 @@ import java.util.function.Consumer;
 
 public class ExecutorManager {
 
+    private static final VarHandle VH_LOCK;
+    private static final Logger LOGGER = LoggerFactory.getLogger("FlowSched ExecutorManager");
+
+    static {
+        try {
+            VH_LOCK = MethodHandles.lookup().findVarHandle(Task.class, "heldLock", int.class);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private final DynamicPriorityTaskQueue<Task> globalWorkQueue;
     private final ConcurrentMap<LockToken, FreeableTaskList> lockListeners = new ConcurrentHashMap<>();
     private final WorkerThread[] workerThreads;
+    private final Consumer<? super Task> releaseLocks = this::doReleaseLock;
     public final Semaphore waitObj = new Semaphore(0);
 
     /**
@@ -123,18 +138,30 @@ public class ExecutorManager {
         }
     }
 
-    /**
-     * Polls an executable task from the global work queue.
-     * @return the task, or {@code null} if no task is executable.
-     */
-    Task pollExecutableTask() {
-        Task task;
-        while ((task = this.globalWorkQueue.dequeue()) != null) {
-            if (this.tryLock(task)) {
-                return task;
+    void runTask(Task task) {
+        try {
+            task.run(releaseLocks);
+        } catch (Throwable t) {
+            LOGGER.error("Exception thrown while executing task", t);
+            try {
+                doReleaseLock(task);
+            } catch (Throwable t1) {
+                t.addSuppressed(t1);
+                LOGGER.error("Exception thrown while releasing locks", t);
+            }
+            try {
+                task.propagateException(t);
+            } catch (Throwable t1) {
+                t.addSuppressed(t1);
+                LOGGER.error("Exception thrown while propagating exception", t);
             }
         }
-        return null;
+    }
+
+    void doReleaseLock(Task task) {
+        if (1 == (int) VH_LOCK.getAndSetAcquire(task, 0)) {
+            this.releaseLocks(task);
+        }
     }
 
     DynamicPriorityTaskQueue<Task> getGlobalWorkQueue() {

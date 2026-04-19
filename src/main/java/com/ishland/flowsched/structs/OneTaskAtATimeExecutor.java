@@ -4,23 +4,19 @@ import java.util.Queue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class OneTaskAtATimeExecutor implements Executor {
+public class OneTaskAtATimeExecutor implements Executor, Runnable {
 
     private final AtomicBoolean currentlyRunning = new AtomicBoolean(false);
     private final Queue<Runnable> queue;
     private final Executor backingExecutor;
-    private final Runnable task = this::run0;
 
     public OneTaskAtATimeExecutor(Queue<Runnable> queue, Executor backingExecutor) {
         this.backingExecutor = backingExecutor;
         this.queue = queue;
     }
 
-    private boolean canRun() {
-        return !this.queue.isEmpty();
-    }
-
-    private void run0() {
+    @Override
+    public void run() {
         try {
             Runnable command;
             while ((command = this.queue.poll()) != null) {
@@ -31,6 +27,9 @@ public class OneTaskAtATimeExecutor implements Executor {
                 }
             }
         } finally {
+            // InitAuther97: volatile set: store cannot be reordered with queue.isEmpty check
+            // set to false -> is empty -> the next offer will schedule
+            // is empty -> the next offer skipped scheduling -> set to false => task leaking
             this.currentlyRunning.set(false);
             this.trySchedule();
         }
@@ -38,12 +37,12 @@ public class OneTaskAtATimeExecutor implements Executor {
 
     private void trySchedule() {
         if (!this.queue.isEmpty() && this.needsWakeup()) {
-            this.backingExecutor.execute(this.task);
+            this.backingExecutor.execute(this);
         }
     }
 
     private boolean needsWakeup() {
-        return this.currentlyRunning.compareAndSet(false, true);
+        return !this.currentlyRunning.getAndSet(true);
     }
 
     @Override

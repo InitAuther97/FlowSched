@@ -1,6 +1,7 @@
 package com.ishland.flowsched.executor;
 
 import java.util.Objects;
+import java.util.function.Consumer;
 
 public class SimpleTask extends Task {
 
@@ -11,11 +12,11 @@ public class SimpleTask extends Task {
     }
 
     @Override
-    public void run(Runnable releaseLocks) {
+    public void run(Consumer<? super Task> releaseLocks) {
         try {
             wrapped.run();
         } finally {
-            releaseLocks.run();
+            releaseLocks.accept(this);
         }
     }
 
