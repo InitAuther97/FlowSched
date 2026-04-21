@@ -125,7 +125,7 @@ class DynamicPriorityTaskQueueTest {
 
     private void assertQueue(TestTask... expected) {
         for (int i = 0; i < expected.length; i++) {
-            assertEquals(expected[i], queue.dequeue(), "Element #" + i + " mismatched");
+            assertEquals(expected[i], queue.dequeue().right(), "Element #" + i + " mismatched");
         }
         if (queue.size() != 0) {
             fail("Queue size mismatched");

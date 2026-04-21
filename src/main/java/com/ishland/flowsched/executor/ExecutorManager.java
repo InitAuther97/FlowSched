@@ -219,7 +219,14 @@ public class ExecutorManager {
      */
     public void changePriority(Task task, int priority) {
         task.pendingPriority = priority;
-        this.globalWorkQueue.changePriority(task, priority);
+        int result = this.globalWorkQueue.changePriority(task, priority);
+        while (result == DynamicPriorityTaskQueue.R_UNINITIALIZED) {
+            Thread.onSpinWait();
+            result = this.globalWorkQueue.changePriority(task, priority);
+        }
+        if (result > 0 && result != priority) {
+            this.waitObj.release(1);
+        }
     }
 
     private static class FreeableTaskList extends ReferenceArrayList<Task> {

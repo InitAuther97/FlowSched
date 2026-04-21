@@ -212,13 +212,13 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
     }
 
-    ItemHolder<K, V, Ctx, UserData>[] allUnreachedDeps(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, int ordinal) {
+    ItemHolder<K, V, Ctx, UserData>[] allUnmetDeps(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, int ordinal, int level) {
         final var array = this.requestedDependencies[ordinal];
         if (array == null) return new ItemHolder[0];
         final var result = new ItemHolder[array.length];
         for (int i = 0; i < array.length; i++) {
             final var holder = scheduler.getHolder(array[i].key());
-            if (holder.getStatus().getOrdinal() >= ordinal - 1) continue;
+            if (holder.getStatus().getOrdinal() >= level) continue;
             result[i] = holder;
         }
         return result;

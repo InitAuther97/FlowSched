@@ -1,5 +1,7 @@
 package com.ishland.flowsched.executor;
 
+import it.unimi.dsi.fastutil.ints.IntReferencePair;
+
 public class WorkerThread extends Thread {
 
     private final ExecutorManager executorManager;
@@ -11,7 +13,7 @@ public class WorkerThread extends Thread {
 
     @Override
     public void run() {
-        while (true) {
+        for (;;) {
             this.executorManager.waitObj.acquireUninterruptibly();
 
             while (!pollTasks()) {
@@ -23,18 +25,18 @@ public class WorkerThread extends Thread {
     }
 
     private boolean pollTasks() {
-        Task task = this.executorManager.getGlobalWorkQueue().dequeue();
-        if (task == null) {
+        IntReferencePair<Task> pair = this.executorManager.getGlobalWorkQueue().dequeue();
+        if (pair == null) {
             return false;
         }
-        if (!this.executorManager.tryLock(task)) {
-            return true; // polled
-        }
-        try {
+        final int priority = pair.leftInt();
+        final Task task = pair.right();
+        if (priority == (int) DynamicPriorityTaskQueue.VH_PRIORITY.getAcquire(task) &&
+                priority == (int) DynamicPriorityTaskQueue.VH_PRIORITY.compareAndExchangeAcquire(task, priority, Task.P_REMOVED) &&
+                this.executorManager.tryLock(task))
             executorManager.runTask(task);
-        } catch (Throwable _) {
-        }
-        return true;
+
+        return true; // polled
     }
 
     public void shutdown() {

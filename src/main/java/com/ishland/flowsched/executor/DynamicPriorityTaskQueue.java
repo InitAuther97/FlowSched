@@ -1,10 +1,12 @@
 package com.ishland.flowsched.executor;
 
+import it.unimi.dsi.fastutil.ints.IntReferencePair;
+
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerArray;
 
 /**
  * A priority queue with fixed number of priorities and allows changing priorities of elements.
@@ -13,13 +15,15 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
  */
 public class DynamicPriorityTaskQueue<E extends Task> {
 
+    private static final VarHandle VH_TASK_COUNT = MethodHandles.arrayElementVarHandle(int[].class);
+
     private final int queueId; // Owner tag
-    private final AtomicIntegerArray taskCount; // Invalidated tasks don't count
+    private final int[] taskCount;
     private final ConcurrentLinkedQueue<E>[] priorities;
 
     public DynamicPriorityTaskQueue(int priorityCount) {
         queueId = QUEUE_ID.getAndIncrement();
-        this.taskCount = new AtomicIntegerArray(priorityCount);
+        this.taskCount = new int[priorityCount];
         //noinspection unchecked
         this.priorities = new ConcurrentLinkedQueue[priorityCount];
         for (int i = 0; i < priorityCount; i++) {
@@ -36,7 +40,7 @@ public class DynamicPriorityTaskQueue<E extends Task> {
         VH_PRIORITY.set(element, priority);
         this.priorities[priority].add(element);
         VH_QUEUEID.setRelease(element, queueId);
-        this.taskCount.incrementAndGet(priority);
+        VH_TASK_COUNT.getAndAddAcquire(this.taskCount, priority, 1);
     }
 
     /**
@@ -75,33 +79,20 @@ public class DynamicPriorityTaskQueue<E extends Task> {
             // or, something else changed its priority
             return witness >= 0 ? R_FAILED : witness;
         }
-
-        this.taskCount.decrementAndGet(witness);
-        this.taskCount.incrementAndGet(priority);
+        VH_TASK_COUNT.getAndAddAcquire(this.taskCount, priority, 1);
         this.priorities[priority].add(element);
         return witness;
     }
 
-    public E dequeue() {
-        priority:
+    public IntReferencePair<E> dequeue() {
         for (int i = 0; i < this.priorities.length; i ++) {
-            if (this.taskCount.get(i) == 0) continue;
-
             ConcurrentLinkedQueue<E> queue = this.priorities[i];
-            E element;
-            do {
-                element = queue.poll();
-                if (element == null) continue priority;
-
-                // If the priority is ever changed:
-                // 1) The task is re-queued by changePriority.
-                // 2) It has been polled.
-                // In both cases we ignore this task and poll the next task.
-                // synchronize with changePriority
-            } while (i != (int) VH_PRIORITY.compareAndExchangeAcquire(element, i, Task.P_REMOVED));
-
-            this.taskCount.decrementAndGet(i);
-            return element;
+            E element = queue.poll();
+            if (element == null) {
+                continue;
+            }
+            VH_TASK_COUNT.getAndAddAcquire(this.taskCount, i, -1);
+            return IntReferencePair.of(i, element);
         }
         return null;
     }
@@ -121,13 +112,13 @@ public class DynamicPriorityTaskQueue<E extends Task> {
             if (witness < 0) return; // removed or dequeued
         } while (!VH_PRIORITY.weakCompareAndSetPlain(element, witness, Task.P_REMOVED));
 
-        this.taskCount.decrementAndGet(witness);
+        VH_TASK_COUNT.getAndAddAcquire(this.taskCount, witness, -1);
     }
 
     public int size() {
         int estimate = 0;
         for (int i = 0; i < this.priorities.length; i++) {
-            estimate += taskCount.get(i);
+            estimate += (int) VH_TASK_COUNT.get(this.taskCount, i);
         }
         return estimate;
     }
