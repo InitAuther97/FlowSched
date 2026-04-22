@@ -7,7 +7,6 @@ import it.unimi.dsi.fastutil.objects.*;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
@@ -130,10 +129,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
                 | ((long) nextStatus << (ItemStatus.STATUS_SIZE + ItemStatus.STATUS_LENGTH));
     }
 
-    static long undirty(long state) {
-        return state & ~FLAG_DIRTY;
-    }
-
     boolean casRelStatus(long expected, byte status) {
         return VH_STATE.weakCompareAndSetRelease(this, expected, withStatus(expected, status));
     }
@@ -198,11 +193,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         long state = (long) VH_STATE.get(this);
         if ((state & FLAG_FREE) == 0) return false;
         return casStatePlain(state, state & ~FLAG_FREE);
-    }
-
-    void lockScheduler() {
-        long state = (long) VH_STATE.getAndBitwiseAndAcquire(this, ~FLAG_FREE);
-        Assertions.assertTrue((state & FLAG_FREE) != 0, "Scheduler is busy when lockScheduler occurs");
     }
 
     void rescheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, boolean skipScheduling) {
@@ -303,15 +293,8 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
                 return;
             }
 
-            // InitAuther97: target status is only changed by tickets thread
-            // which is properly synchronized via synchronized block
-            // Memory ordering: release, check when removing synchronization
             futuresToFail = new CompletableFuture[oldTarget - newTarget];
             for (int i = newTarget + 1; i <= oldTarget; i++) {
-                // InitAuther97: use swap because of possible racing set.
-                // Acquire ensures that we see a properly initialized future.
-                // Writes to futures are all guarded with synchronization on ticket sets,
-                // so they are always witnessed in the program order.
                 futuresToFail[i - newTarget - 1] = this.futures[i];
                 this.futures[i] = UNLOADED_FUTURE;
             }
@@ -319,7 +302,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
 
         // InitAuther97: now we fail any future that either exists before removing
-        // or gets stuffed into the array when removing
         // noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < futuresToFail.length; i++) {
             futuresToFail[i].completeExceptionally(UNLOADED_EXCEPTION);
@@ -467,66 +449,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     public ItemStatus<K, V, Ctx> getStatus0() {
         return unloadedStatus.getAt(getStatus(lpState()));
-    }
-
-    void flushUnloadedStatus(ItemStatus<K, V, Ctx> currentStatus) {
-        ArrayList<CompletableFuture<?>> futuresToFire = null;
-        if (currentStatus.getNext() == null) {
-            return;
-        }
-        synchronized (this.tickets) {
-            ItemStatus<K, V, Ctx> targetStatus = this.getTargetStatus();
-            if (targetStatus.getNext() == null) {
-                return;
-            }
-            for (int i = Math.max(currentStatus.getOrdinal(), targetStatus.getOrdinal()) + 1; i < this.futures.length; i ++) {
-                if (futuresToFire == null) futuresToFire = new ArrayList<>();
-                CompletableFuture<?> oldFuture = this.futures[i];
-                futuresToFire.add(oldFuture);
-                this.futures[i] = UNLOADED_FUTURE;
-            }
-        }
-        if (futuresToFire != null) {
-            for (int i = 0, finalFuturesToFireSize = futuresToFire.size(); i < finalFuturesToFireSize; i++) {
-                CompletableFuture<?> future = futuresToFire.get(i);
-                future.completeExceptionally(UNLOADED_EXCEPTION);
-            }
-        }
-    }
-
-    void validateCompletedFutures(ItemStatus<K, V, Ctx> current) {
-        synchronized (this.tickets) {
-            for (int i = this.unloadedOrdinal + 1; i <= current.getOrdinal(); i++) {
-                CompletableFuture<?> future = this.futures[i];
-                Assertions.assertTrue(future != UNLOADED_FUTURE, "Future for loaded status cannot be UNLOADED_FUTURE");
-                Assertions.assertTrue(future.isDone(), "Future for loaded status must be completed");
-            }
-        }
-    }
-
-    void validateAllFutures() {
-        synchronized (this.tickets) {
-            for (int i = this.unloadedOrdinal + 1; i < this.futures.length; i++) {
-                CompletableFuture<?> future = this.futures[i];
-                if (i <= this.getStatus0().getOrdinal()) {
-                    Assertions.assertTrue(future.isDone(), "Future for loaded status must be completed");
-                }
-                if (i <= this.getTargetStatus().getOrdinal()) {
-                    Assertions.assertTrue(future != UNLOADED_FUTURE, "Future for requested status cannot be UNLOADED_FUTURE");
-                } else {
-                    Assertions.assertTrue(future == UNLOADED_FUTURE, "Future for non-requested status must be UNLOADED_FUTURE");
-                }
-            }
-        }
-    }
-
-    void validateRequestedFutures(ItemStatus<K, V, Ctx> current) {
-        synchronized (this.tickets) {
-            for (int i = this.unloadedOrdinal + 1; i <= current.getOrdinal(); i++) {
-                CompletableFuture<?> future = this.futures[i];
-                Assertions.assertTrue(future != UNLOADED_FUTURE, "Future for requested status cannot be UNLOADED_FUTURE");
-            }
-        }
     }
 
     public synchronized void setDependencies(ItemStatus<K, V, Ctx> status, KeyStatusPair<K, V, Ctx>[] dependencies) {

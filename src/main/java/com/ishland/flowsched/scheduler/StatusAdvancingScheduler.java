@@ -152,6 +152,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             if (holder.isDependencyDirty()) {
                 holder.flushDependencyCache0(this);
             }
+            Assertions.assertTrue(!holder.holdsDependency(), "BUG: %s still holds some dependencies when ready for unloading", holder.getKey());
 //          System.out.println("Unloaded: " + key);
             if (!holder.release(state)) {
                 // for (int i = 0; i < failures; i++) Thread.onSpinWait();
