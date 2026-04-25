@@ -122,7 +122,7 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         final byte unloadedOrdinal = getUnloadedStatus().getOrdinal();
         final ItemStatus<K, V, Ctx> nextStatus;
         final byte nextOrdinal;
-        for(int failures = 0; ; failures++) {
+        for (int failures = 0; ; failures++) {
             state = holder.loState();
             final byte targetOrdinal = ItemHolder.getTargetStatus(state);
             final ItemStatus<K, V, Ctx> next = getNextStatus(current, targetOrdinal);

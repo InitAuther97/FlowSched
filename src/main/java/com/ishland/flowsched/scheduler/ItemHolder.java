@@ -19,14 +19,18 @@ import static com.ishland.flowsched.util.Constant.*;
 @SuppressWarnings("unused")
 class ItemHolderHotField {
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
-    /// flag_busy (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
+    /// flag_free (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
     protected volatile long state; // Core synchronization point, responsible for upgrade/downgrade/future
+    /// flag_flush (1bit)
     protected volatile int schedulerState;
+}
+
+class ItemHolderPadding1 extends ItemHolderHotField {
     private int i1;
     private long l12, l13, l14, l15, l16, l17; // padding
 }
 
-public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
+public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
 
     // private static final VarHandle VH_SCHEDULED_DIRTY;
     static final VarHandle VH_STATE, VH_SCHEDULER_STATE;
@@ -58,7 +62,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     private final K key;
     private UserData userData; // Stable value
     private final ItemStatus<K, V, Ctx> unloadedStatus;
-    private final byte unloadedOrdinal;
     private final OneTaskAtATimeExecutor criticalSectionExecutor;
 
 //  private final List<Pair<ItemStatus<K, V, Ctx>, Long>> statusHistory = ReferenceLists.synchronize(new ReferenceArrayList<>());
@@ -81,7 +84,6 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
 
     ItemHolder(ItemStatus<K, V, Ctx> initialStatus, K key, ObjectFactory objectFactory, Executor backgroundExecutor) {
         this.unloadedStatus = Objects.requireNonNull(initialStatus);
-        this.unloadedOrdinal = initialStatus.getOrdinal();
         this.key = Objects.requireNonNull(key);
         ItemStatus<K, V, Ctx>[] allStatuses = initialStatus.getAllStatuses();
         this.tickets = new Set[allStatuses.length];
@@ -96,7 +98,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         }
         this.criticalSectionExecutor = new OneTaskAtATimeExecutor(new ConcurrentLinkedQueue<>(), backgroundExecutor);
         final int length = initialStatus.getAllStatuses().length;
-        this.depRefCntCreate =k -> {
+        this.depRefCntCreate = k -> {
             int[] refCnt = new int[length];
             Arrays.fill(refCnt, -1);
             return refCnt;
@@ -133,11 +135,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return VH_STATE.weakCompareAndSetRelease(this, expected, withStatus(expected, status));
     }
 
-    boolean casStatePlain(long expected, long next) {
+    boolean casStateRelaxed(long expected, long next) {
         return expected == (long) VH_STATE.compareAndExchangeAcquire(this, expected, next);
     }
 
-    long andStatePlain(long and) {
+    long andStateRelaxed(long and) {
         return (long) VH_STATE.getAndBitwiseAndAcquire(this, and);
     }
 
@@ -149,10 +151,15 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
         return (long) VH_STATE.getAndBitwiseAndRelease(this, ~(1L << ordinal));
     }
 
+    /// Load the state with the acquire semantics. Useful when determining
+    /// the state of the holder from external.
     long loState() {
         return (long) VH_STATE.getAcquire(this);
     }
 
+    /// Load the state, allowing possible register hoisting to happen.
+    /// This is usually okay when the value is later verified using CAS or
+    /// is guaranteed to be valid by implicit memory ordering from the context.
     long lpState() {
         return (long) VH_STATE.get(this);
     }
@@ -192,7 +199,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     boolean tryLockSchedulerRelaxed() {
         long state = (long) VH_STATE.get(this);
         if ((state & FLAG_FREE) == 0) return false;
-        return casStatePlain(state, state & ~FLAG_FREE);
+        return casStateRelaxed(state, state & ~FLAG_FREE);
     }
 
     void rescheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, boolean skipScheduling) {
@@ -349,7 +356,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     }
 
     public boolean tryMarkDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
-        long state = (long) VH_STATE.get(this);
+        long state = (long) VH_STATE.getOpaque(this); // InitAuther97: must do actual loading
         if ((state & FLAG_REMOVED) != 0) {
             return false;
         }
@@ -528,7 +535,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderHotField {
     public void clearFlag(long flag) {
         Assertions.assertTrue((flag & FLAG_REMOVED) == 0, "Cannot clear FLAG_REMOVED");
         assertOpen();
-        andStatePlain(~flag);
+        andStateRelaxed(~flag);
     }
 
     boolean release(long state) {
