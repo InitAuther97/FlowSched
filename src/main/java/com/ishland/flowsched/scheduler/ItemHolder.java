@@ -18,6 +18,16 @@ import static com.ishland.flowsched.util.Constant.*;
 
 @SuppressWarnings("unused")
 class ItemHolderHotField {
+    /*
+     * Status are always modified by two properly synchronized procedures.
+     * So we take them as two threads.
+     * Scheduler thread: Look at ticket bitset and status and decide the changing status.
+     * If we are unloaded, set flag_removed; When the upgrade/downgrade is completed,
+     * complete the future and set the status. If it's completed exceptionally, set
+     * flag_broken. When everything is done, set flag_free.
+     * Ticket thread: Flip ticket bitset and mark flag_dirty. Check the status and determine
+     * if early ticket completion is needed.
+     */
     // private long l0, l1, l2, l3, l4, l5, l6, l7;
     /// flag_free (1bit) | flag_dirty (1bit) | flag_broken (1bit) | flag_removed (1bit) | changing status (5bit) | status (5bit) | ticket bitset (32bit)
     protected volatile long state; // Core synchronization point, responsible for upgrade/downgrade/future
@@ -30,6 +40,22 @@ class ItemHolderPadding1 extends ItemHolderHotField {
     private long l12, l13, l14, l15, l16, l17; // padding
 }
 
+/**
+ * A holder for a scheduled item, tracking its current status, active tickets, futures, and dependencies.
+ *
+ * <h3>Core invariant: Future availability</h3>
+ * Between a successful {@link #addTicket} for a status and the removal of the last ticket for that status,
+ * {@code futures[ordinal]} is guaranteed to be a valid, non-UNLOADED {@link CompletableFuture}. Callers may
+ * obtain it at any point during the ticket's lifetime via {@link #getFutureForStatus(ItemStatus)} or
+ * {@link #getFutureForStatus0(ItemStatus)} and it will eventually complete — successfully when the status
+ * is reached, or exceptionally when the last ticket is removed before the status is reached.
+ *
+ * <h3>Scheduler responsibility</h3>
+ * The scheduler ({@link StatusAdvancingScheduler}) must drive this holder through the status chain:
+ * upgrade it when the target status (highest-ticketed status) exceeds the current status, and downgrade
+ * it when tickets are removed and the target drops below the current status. The holder itself only
+ * provides the state-tracking primitives; the scheduler owns the upgrade/downgrade decision logic.
+ */
 public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
 
     // private static final VarHandle VH_SCHEDULED_DIRTY;
@@ -78,7 +104,18 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     private boolean dependencyDirty = false; // Used in dependency critical section
 
     private final Set<ItemTicket>[] tickets;
-    private final CompletableFuture<?>[] futures; // Futures to fire by setStatus, only written by ticket ops threads
+    /**
+     * Core invariant: After a ticket is added for a status and before the last ticket for that status is removed,
+     * this.futures[ordinal] is always a valid, non-UNLOADED {@link CompletableFuture}. It is safe to call
+     * {@link #getFutureForStatus(ItemStatus)} or {@link #getFutureForStatus0(ItemStatus)} at any point during
+     * the ticket's lifetime and the returned future will eventually complete (either successfully when the status
+     * is reached, or exceptionally when the last ticket is removed before the status is reached).
+     *
+     * <p>This is guaranteed by {@link #addTicket} calling {@link #createFutures} when the target status rises,
+     * and {@link #removeTicket} only resetting futures to UNLOADED_FUTURE when the last ticket leaves
+     * and the overall target drops.</p>
+     */
+    private final CompletableFuture<?>[] futures;
     private V item; // Piggyback on future when read off scheduler threads
     private Cancellable runningAction = null; // Only used by scheduler threads
 
@@ -289,14 +326,16 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
             }
 
             final long mask = ~(1L << ordinal);
-            // InitAuther97: the affected futures are all masked by getFutureForStatus0 to UNLOADED_FUTURE.
-            // if they unfortunately modify the futures (inserting a new one), it will be completed exceptionally later.
-            // Release semantics is used here to support the use of state check as a synchronization point
+            // InitAuther97: use Plain
             final long oldState = lpState();
             final byte oldTarget = getTargetStatus(oldState), newTarget = getTargetStatus(oldState & mask);
 
+            // InitAuther97: the affected futures are all masked by getFutureForStatus0 to UNLOADED_FUTURE.
+            // if they unfortunately modify the futures (inserting a new one), it will be completed exceptionally later.
+            // Release semantics is used here to support the use of state check as a synchronization point
+            unsetTargetRelease(ordinal);
+
             if (oldTarget == newTarget) {
-                unsetTargetRelease(ordinal);
                 return;
             }
 
@@ -305,10 +344,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
                 futuresToFail[i - newTarget - 1] = this.futures[i];
                 this.futures[i] = UNLOADED_FUTURE;
             }
-            unsetTargetRelease(ordinal);
         }
 
-        // InitAuther97: now we fail any future that either exists before removing
+        // InitAuther97: now we fail any future that exists before removing
         // noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < futuresToFail.length; i++) {
             futuresToFail[i].completeExceptionally(UNLOADED_EXCEPTION);

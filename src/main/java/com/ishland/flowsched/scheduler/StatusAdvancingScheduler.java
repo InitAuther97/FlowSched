@@ -127,8 +127,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             final byte targetOrdinal = ItemHolder.getTargetStatus(state);
             final ItemStatus<K, V, Ctx> next = getNextStatus(current, targetOrdinal);
             final byte nextOrdinal0 = next.getOrdinal();
-//          holder.validateCompletedFutures(current);
-//          holder.sanitizeSetStatus = null;
             if (nextOrdinal0 != currentOrdinal) {
                 // Change of next status doesn't mean anything, we still use status change as the message
                 if (!ItemHolder.VH_STATE.weakCompareAndSetPlain(holder, state, ItemHolder.withNextStatus(state, nextOrdinal0))) {
@@ -139,8 +137,6 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                 nextOrdinal = nextOrdinal0;
                 break;
             }
-            // holder.flushUnloadedStatus(current);
-            // holder.validateAllFutures();
             if (currentOrdinal != unloadedOrdinal) {
                 holder.flushDependencyCache0(this);
                 if (!ItemHolder.VH_STATE.weakCompareAndSetPlain(holder, state, state | ItemHolder.FLAG_FREE)) {
