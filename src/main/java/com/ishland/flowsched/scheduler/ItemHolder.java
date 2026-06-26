@@ -35,8 +35,10 @@ class ItemHolderHotField {
     protected volatile int schedulerState;
 }
 
+@SuppressWarnings("unused")
+// TODO Use some runtime class modify stuff to generate padding adequate to the cache line size
 class ItemHolderPadding1 extends ItemHolderHotField {
-    private int i1;
+    private long l11;
     private long l12, l13, l14, l15, l16, l17; // padding
 }
 
@@ -45,10 +47,15 @@ class ItemHolderPadding1 extends ItemHolderHotField {
  *
  * <h3>Core invariant: Future availability</h3>
  * Between a successful {@link #addTicket} for a status and the removal of the last ticket for that status,
- * {@code futures[ordinal]} is guaranteed to be a valid, non-UNLOADED {@link CompletableFuture}. Callers may
- * obtain it at any point during the ticket's lifetime via {@link #getFutureForStatus(ItemStatus)} or
+ * {@code futures[i]} where {@code i <= ordinal} is guaranteed to be a valid, non-UNLOADED {@link CompletableFuture}.
+ * Callers may obtain it at any point during the ticket's lifetime via {@link #getFutureForStatus(ItemStatus)} or
  * {@link #getFutureForStatus0(ItemStatus)} and it will eventually complete — successfully when the status
  * is reached, or exceptionally when the last ticket is removed before the status is reached.
+ *
+ * <h3>Core invariant: Holder lifecycle</h3>
+ * <b>It is guaranteed that, when a ticket bitset is set to a level, the holder immediately stops downgrading
+ * and will only upgrade until it reaches the target status or the target status drops below current status,
+ * in which case the scheduler may downgrade it after one or more further upgrades.</b>
  *
  * <h3>Scheduler responsibility</h3>
  * The scheduler ({@link StatusAdvancingScheduler}) must drive this holder through the status chain:
@@ -73,6 +80,8 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     public static final long FLAG_DIRTY = 1L << 44;
 
     public static final long FLAG_FREE = 1L << 45;
+
+    public static final byte R_REMOVED = 0, R_CHANGED = 1, R_MARK_DIRTY = 2;
 
     static {
         try {
@@ -104,20 +113,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     private boolean dependencyDirty = false; // Used in dependency critical section
 
     private final Set<ItemTicket>[] tickets;
-    /**
-     * Core invariant: After a ticket is added for a status and before the last ticket for that status is removed,
-     * this.futures[ordinal] is always a valid, non-UNLOADED {@link CompletableFuture}. It is safe to call
-     * {@link #getFutureForStatus(ItemStatus)} or {@link #getFutureForStatus0(ItemStatus)} at any point during
-     * the ticket's lifetime and the returned future will eventually complete (either successfully when the status
-     * is reached, or exceptionally when the last ticket is removed before the status is reached).
-     *
-     * <p>This is guaranteed by {@link #addTicket} calling {@link #createFutures} when the target status rises,
-     * and {@link #removeTicket} only resetting futures to UNLOADED_FUTURE when the last ticket leaves
-     * and the overall target drops.</p>
-     */
+
     private final CompletableFuture<?>[] futures;
     private V item; // Piggyback on future when read off scheduler threads
     private Cancellable runningAction = null; // Only used by scheduler threads
+    private final Object futureSync = new Object();
 
     ItemHolder(ItemStatus<K, V, Ctx> initialStatus, K key, ObjectFactory objectFactory, Executor backgroundExecutor) {
         this.unloadedStatus = Objects.requireNonNull(initialStatus);
@@ -203,6 +203,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
 
     /**
      * Not thread-safe, protect with statusMutex
+     * Because we eagerly fail all futures in removeTicket,
+     * we also need a way to eagerly fire completed futures.
+     * The logic is as described below
      */
     private void createFutures(byte from, byte to, byte status) {
         for (int i = from + 1; i <= to; i++) {
@@ -233,12 +236,18 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         return this.unloadedStatus.getAt(getTargetStatus(loState()));
     }
 
+    /// Checked by the scheduler to avoid concurrent scheduling entrance
+    /// Usually happen when adding a lot of tickets in different levels
     boolean tryLockSchedulerRelaxed() {
         long state = (long) VH_STATE.get(this);
         if ((state & FLAG_FREE) == 0) return false;
         return casStateRelaxed(state, state & ~FLAG_FREE);
     }
 
+    /// Used by RxJava async pipelines to re-schedule a tickHolder0 instead of
+    /// using something like consolidateMarkDirty().
+    /// Specific branches that do not trigger a rescheduling will pass true to skipScheduling
+    /// In the pipeline this is done by firing downstream with a {@link SkipSchedulingException}
     void rescheduleTick(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, boolean skipScheduling) {
         long state = setFlag(skipScheduling ? FLAG_FREE : FLAG_FREE | FLAG_DIRTY);
         if (!skipScheduling && (state & FLAG_DIRTY) == 0) {
@@ -246,6 +255,8 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         }
     }
 
+    // For debug use, invoke this in debugger produces all deps that do not reach the dependency status
+    // Need you to at least make the ItemTicket logic correct
     ItemHolder<K, V, Ctx, UserData>[] allUnmetDeps(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler, int ordinal, int level) {
         final var array = this.requestedDependencies[ordinal];
         if (array == null) return new ItemHolder[0];
@@ -258,6 +269,8 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         return result;
     }
 
+    // Some shit code trying to actively prevent an unloaded holder from marked as removed
+    // Doesn't sound useful but still listed below
     /*
     private boolean rescueHolder(ItemStatus<K, V, Ctx> targetStatus, long state) {
         final byte target = targetStatus.getOrdinal();
@@ -266,7 +279,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     }
      */
 
-    public boolean addTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
+    public byte addTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
         Objects.requireNonNull(ticket);
         long state;
         /*
@@ -279,23 +292,30 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         }
          */
         final byte ordinal = targetStatus.getOrdinal();
+        byte retVal;
         block:
-        synchronized (this) {
+        synchronized (this.futureSync) {
+            // Load state for FLAG_REMOVED check.
+            // Stale value is fine.
             state = lpState();
             if ((state & FLAG_REMOVED) != 0) {
-                return false;
+                return R_REMOVED;
             }
+            // Add tickets
             final var set = this.tickets[ordinal];
             final boolean change = set.isEmpty();
             if (!set.add(ticket)) {
                 throw new IllegalStateException("Ticket already exists");
             }
+            // exit early if no need to create futures
             if (!change) {
+                retVal = R_CHANGED;
                 break block;
             }
+            // Set target status release.
             state = setTargetRelease(ordinal);
             if ((state & FLAG_REMOVED) != 0) {
-                return false;
+                return R_REMOVED;
             }
             final byte oldTarget = getTargetStatus(state);
             final byte status = getStatus(state);
@@ -303,42 +323,52 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
             if (ordinal > oldTarget) {
                 createFutures(oldTarget, ordinal, status);
             }
+            retVal = R_MARK_DIRTY;
         }
         byte target = targetStatus.getOrdinal();
         final byte current = getStatus(state);
         if (current >= target) {
             ticket.consumeCallback();
         }
-        return true;
+        return retVal;
     }
 
-    public void removeTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
+    public byte removeTicket(ItemStatus<K, V, Ctx> targetStatus, ItemTicket ticket) {
         assertOpen();
         CompletableFuture<?>[] futuresToFail;
         final byte ordinal = targetStatus.getOrdinal();
-        synchronized (this) {
+        synchronized (this.futureSync) {
             final var set = this.tickets[ordinal];
             if (!set.remove(ticket)) {
                 throw new IllegalStateException("Ticket does not exist");
             }
             if (!set.isEmpty()) {
-                return;
+                return R_CHANGED;
             }
 
             final long mask = ~(1L << ordinal);
-            // InitAuther97: use Plain
+            // InitAuther97: We use plain here because the only meaningful thing to us is target status.
+            // Target status and futures are always updated in futureSync critical section together.
+            // So we don't need another memory barrier to ensure visibility. It's already published when
+            // we acquire the futureSync monitor.
             final long oldState = lpState();
             final byte oldTarget = getTargetStatus(oldState), newTarget = getTargetStatus(oldState & mask);
 
-            // InitAuther97: the affected futures are all masked by getFutureForStatus0 to UNLOADED_FUTURE.
-            // if they unfortunately modify the futures (inserting a new one), it will be completed exceptionally later.
-            // Release semantics is used here to support the use of state check as a synchronization point
+            // Unset the targets, allowing downgrade to happen
+            // We don't fail futures on setStatusDowngrade, instead we fail them all here
+            // This ensures correct ordering of future operations at the cost of a little
+            // longer critical section. But overall it's worth it.
             unsetTargetRelease(ordinal);
 
             if (oldTarget == newTarget) {
-                return;
+                return R_CHANGED;
             }
 
+            // TODO
+            // It is still a question mark whether caching them out of critical section and fire them
+            // outside actually outperforms firing them in place. This will definitely heap allocate
+            // the array since the index access is definitely not compile time deterministic.
+            // Allocation may cost a leg in specific memory constrained environment.
             futuresToFail = new CompletableFuture[oldTarget - newTarget];
             for (int i = newTarget + 1; i <= oldTarget; i++) {
                 futuresToFail[i - newTarget - 1] = this.futures[i];
@@ -351,6 +381,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         for (int i = 0; i < futuresToFail.length; i++) {
             futuresToFail[i].completeExceptionally(UNLOADED_EXCEPTION);
         }
+        return R_MARK_DIRTY;
     }
 
     public void subscribeOp(Completable op, StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
@@ -394,7 +425,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     }
 
     public boolean tryMarkDirty(StatusAdvancingScheduler<K, V, Ctx, UserData> scheduler) {
-        long state = (long) VH_STATE.getOpaque(this); // InitAuther97: must do actual loading
+        // InitAuther97: do actual loading
+        // Stale values may penetrate the loose check and hit cas loop hard
+        long state = (long) VH_STATE.getOpaque(this);
         if ((state & FLAG_REMOVED) != 0) {
             return false;
         }
@@ -419,7 +452,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         });
     }
 
-    /// Whether downgrading can proceed
+    /// CAS current status to toStatus if downgrading can proceed
+    /// We don't allow downgrading once target status is set higher
+    /// So, this is the final frontier
+    /// target status acts as a synchronization point; it's also
+    /// the reason we choose release for target bitset rmw
     private boolean casStateDowngrade(byte toStatus) {
         long state = loState();
         if (getTargetStatus(state) > toStatus) {
@@ -435,6 +472,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         return true;
     }
 
+    /// CAS current status to newStatus
+    /// Because we're only publishing holder status, we use relaxed
+    /// ordering on the load side
     private void casStateAdvance(byte newStatus) {
         long state = lpState();
         while (!casRelStatus(state, newStatus)) {
@@ -449,13 +489,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         final long state = lpState();
         final var current = unloadedStatus.getAt(getStatus(state));
         Assertions.assertTrue(status.getNext() == current, "Invalid status downgrade");
-        if (!casStateDowngrade(ordinal)) {
-            return false;
-        }
-        // Ensure that we see a properly initialized future
-        // final var future = (CompletableFuture<?>) VH_FUTURES.getAndSetAcquire(this.futures, ordinal, UNLOADED_FUTURE);
-        // future.completeExceptionally(UNLOADED_EXCEPTION);
-        return true;
+        return casStateDowngrade(ordinal);
     }
 
     public void setStatusAdvance(ItemStatus<K, V, Ctx> status) {
@@ -464,7 +498,10 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         final var current = getStatus0();
         Assertions.assertTrue(status.getPrev() == current, "Invalid status upgrade");
         final ItemTicket[] ticketsToFire;
-        synchronized (this) {
+        // The synchronization is necessary
+        // 1. Make sure the future set by addTicket is observed
+        // 2. block status advance until future creation is completed
+        synchronized (this.futureSync) {
             casStateAdvance(ordinal);
             ticketsToFire = this.tickets[ordinal].toArray(ItemTicket[]::new);
         }
@@ -476,6 +513,9 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         futureToFire.complete(null);
     }
 
+    /// Set status when downgrading is cancelled. Effectively an upgrade, but with loose constrains.
+    /// Here the downgrade is not successful, so no need to fire tickets, as they're handled by
+    /// addTicket properly.
     public void setStatusForDowngradeCancellation(ItemStatus<K, V, Ctx> status) {
         assertOpen();
         final byte ordinal = status.getOrdinal();
@@ -496,6 +536,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         return unloadedStatus.getAt(getStatus(lpState()));
     }
 
+    /// We should really migrate away from synchronized(this) now, they just simply conflict
     public synchronized void setDependencies(ItemStatus<K, V, Ctx> status, KeyStatusPair<K, V, Ctx>[] dependencies) {
         assertOpen();
         final int ordinal = status.getOrdinal();
@@ -517,12 +558,15 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         return this.key;
     }
 
+    /// Usage should take care with synchronization like addTicket or getStatus
     public CompletableFuture<?> getFutureForStatus(ItemStatus<K, V, Ctx> status) {
         return getFutureForStatus0(status).copy();
     }
 
     /**
      * Only for trusted methods
+     * Usages already consider synchronization problem; in Vanilla these happen concurrently and
+     * are inherently properly synchronized.
      */
     public CompletableFuture<?> getFutureForStatus0(ItemStatus<K, V, Ctx> status) {
         final byte ordinal = status.getOrdinal();
@@ -534,6 +578,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     }
 
     /// Access mode: plain, piggyback on status when accessed off scheduling
+    /// It's always safe to access within world generation pipeline
     public V getItem() {
         return this.item;
     }
@@ -550,10 +595,14 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
     }
 
     /// Note: access mode is plain, make sure there is proper synchronization before sharing.
+    /// This is only used to initialize the stable user data.
+    /// It is possible to replace it with LazyConstant. But it's useless in this case.
     public void setUserData(UserData userData) {
         this.userData = userData;
     }
 
+    /// Flags are only set and accessed by scheduler thread by default.
+    /// Use plain access is enough inside world generation pipeline.
     /// Access mode: plain
     public long getFlagsPlain() {
         return (long) VH_STATE.get(this) & -1 >>> Long.SIZE - ItemStatus.STATUS_LENGTH - ItemStatus.STATUS_SIZE * 2;
@@ -576,6 +625,7 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         andStateRelaxed(~flag);
     }
 
+    /// Tries to mark this holder as removed and mark it free.
     boolean release(long state) {
         // Don't change it to getAndBitwiseOr, as logic in add/remove ticket never checked for holder's availability
         // We are not in a hurry to remove a holder! Ticket operations are complex enough!

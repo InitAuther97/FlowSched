@@ -99,6 +99,23 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
     protected void onItemDowngrade(ItemHolder<K, V, Ctx, UserData> holder, ItemStatus<K, V, Ctx> statusReached) {
     }
 
+    /**
+     * Tick goes like this: First, check if the holder is open; if not just return.
+     *
+     * Then, try to exclusively lock scheduler. This is held during the whole world generation pipeline.
+     * If the lock is already held, run tickHolderBusy logic.
+     *
+     * The scheduling state is determined in an attempt style; only a successful CAS back into the state
+     * means that this scheduling is valid, otherwise, updates occurred when scheduling is running, and
+     * it's now visible to us; the holder is only marked free again at the end of the pipeline.
+     * This consolidates multiple ticket operations, reducing task count on the critical section executor.
+     *
+     * Operations like flushDependencyCache0, which used to be scheduled directly into the executor, are
+     * now implemented as a part of holder tick, which actively checks for such task to run. Since the
+     * operations are usually marked to schedulerState within the scheduler thread, update to the field
+     * is not atomic, to reduce atomic rmw overhead.
+     * @param holder
+     */
     void tickHolder0(ItemHolder<K, V, Ctx, UserData> holder) {
         // May happen if removeTicket marks dirty too late while the holder is ticking
         if (!holder.isOpen()) {
@@ -111,6 +128,8 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             final var current = ItemHolder.getStatus(state);
             final var target = ItemHolder.getTargetStatus(state);
             if ((next < current && current <= target) || (next > current && current >= target)) holder.tryCancelAction();
+            // InitAuther97: If the scheduler is not released, then the update is definitely visible to the scheduler,
+            // and will be processed as soon as possible. Removing markDirty as it will waste your power.
             // holder.markDirty(this);
             return;
         }
@@ -128,7 +147,8 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
             final ItemStatus<K, V, Ctx> next = getNextStatus(current, targetOrdinal);
             final byte nextOrdinal0 = next.getOrdinal();
             if (nextOrdinal0 != currentOrdinal) {
-                // Change of next status doesn't mean anything, we still use status change as the message
+                // Change of next status doesn't mean anything. Only the change of current status and next
+                // status are synchronization points
                 if (!ItemHolder.VH_STATE.weakCompareAndSetPlain(holder, state, ItemHolder.withNextStatus(state, nextOrdinal0))) {
                     // for (int i = 0; i < failures; i++) Thread.onSpinWait();
                     continue;
@@ -538,10 +558,15 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         }
         try {
             ItemHolder<K, V, Ctx, UserData> holder;
+            byte retVal;
             do {
                 holder = this.getOrCreateHolder(key);
-            } while (!holder.addTicket(targetStatus, ticket)); // Holder is removed before we had chance to add a ticket to it, retry
-            holder.markDirty(this);
+                retVal = holder.addTicket(targetStatus, ticket);
+            } while (retVal == ItemHolder.R_REMOVED); // Holder is removed before we had chance to add a ticket to it, retry
+            // Eliminate some useless markDirty here
+            if (retVal == ItemHolder.R_MARK_DIRTY) {
+                holder.markDirty(this);
+            }
             return holder;
         } catch (Throwable t) {
             t.printStackTrace();
@@ -570,9 +595,11 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
         if (holder == null) {
             throw new IllegalStateException("No such item");
         }
-        holder.removeTicket(targetStatus, ticket);
-        // holder may have been removed at this point, only mark it dirty if it still exists
-        holder.tryMarkDirty(this);
+        // Eliminate some useless markDirty here
+        if (ItemHolder.R_MARK_DIRTY == holder.removeTicket(targetStatus, ticket)) {
+            // holder may have been removed at this point, only mark it dirty if it still exists
+            holder.tryMarkDirty(this);
+        }
     }
 
     private ItemStatus<K, V, Ctx> getNextStatus(ItemStatus<K, V, Ctx> currentStatus, byte target) {
