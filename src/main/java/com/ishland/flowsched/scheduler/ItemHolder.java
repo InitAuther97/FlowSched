@@ -506,11 +506,11 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
             ticketsToFire = this.tickets[ordinal].toArray(ItemTicket[]::new);
         }
         final var futureToFire = this.futures[ordinal];
+        futureToFire.complete(null);
         //noinspection ForLoopReplaceableByForEach
         for (int i = 0; i < ticketsToFire.length; i++) {
             ticketsToFire[i].consumeCallback();
         }
-        futureToFire.complete(null);
     }
 
     /// Set status when downgrading is cancelled. Effectively an upgrade, but with loose constrains.
