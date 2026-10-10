@@ -513,9 +513,17 @@ public class ItemHolder<K, V, Ctx, UserData> extends ItemHolderPadding1 {
         }
     }
 
+    /// InitAuther97: the logic below is crap. I leave it here because I need to remind myself of
+    /// the poor mistake I had here.
+    /// Basically you still need to use setStatusAdvance because you "may" (and that means you will)
+    /// need to fire tickets added after a cancelled downgrade, cuz YOU HAVE ALREADY DOWNGRADED STATUS!
+    /// It is recommended to get some more sleep before coding concurrent stuffs.
+    ///
+    ///
     /// Set status when downgrading is cancelled. Effectively an upgrade, but with loose constrains.
     /// Here the downgrade is not successful, so no need to fire tickets, as they're handled by
     /// addTicket properly.
+    @SuppressWarnings("unused")
     public void setStatusForDowngradeCancellation(ItemStatus<K, V, Ctx> status) {
         assertOpen();
         final byte ordinal = status.getOrdinal();

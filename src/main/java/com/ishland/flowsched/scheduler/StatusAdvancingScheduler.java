@@ -244,7 +244,8 @@ public abstract class StatusAdvancingScheduler<K, V, Ctx, UserData> {
                             while (actual instanceof CompletionException ex) actual = ex.getCause();
                             if (cancellable.isCancelled() && actual instanceof CancellationException) {
                                 if (hasDowngraded.getPlain()) {
-                                    holder.setStatusForDowngradeCancellation(current);
+                                    // InitAuther97: we still need to advance because we may need to fire tickets
+                                    holder.setStatusAdvance(current);
                                 }
                                 return;
                             }
